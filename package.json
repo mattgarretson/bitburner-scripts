@@ -1,0 +1,19 @@
+{
+  "name": "bitburner-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bitburner 3.0.2 scripts synced through the Remote File API",
+  "scripts": {
+    "sync": "bitburner-filesync",
+    "check": "tsc --noEmit",
+    "test": "node --test",
+    "format": "prettier --write \"src/**/*.{js,ts}\" \"tests/**/*.{js,ts}\"",
+    "format:check": "prettier --check \"src/**/*.{js,ts}\" \"tests/**/*.{js,ts}\""
+  },
+  "devDependencies": {
+    "bitburner-filesync": "^1.1.5",
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0"
+  }
+}
