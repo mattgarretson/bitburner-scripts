@@ -113,7 +113,10 @@ planning, so it must not be circumvented anywhere.
 ## In-progress work: the multi-target scheduler
 
 `docs/multi-target-design.md` is the accepted design for a multi-target scheduler and is
-the spec to follow for that work. Load-bearing rules from it and from `AGENTS.md`:
+the spec to follow for that work. `docs/scheduler-improvement-plan.md` is the current
+ordered work list against that scheduler — dependency-ordered, so do its items in order.
+
+Load-bearing rules from the design doc and from `AGENTS.md`:
 
 - **Do not modify `manager.ts` or the workers** while building it — `manager.ts` stays as
   the stable single-target fallback. New code goes in `multi-manager.ts` (loop + status),

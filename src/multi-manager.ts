@@ -19,7 +19,7 @@
  *   run multi-manager.ts --report
  */
 
-import { clamp, formatRam, loadWorkers } from "./hacking-lib.ts";
+import { clamp, formatRam, loadWorkers, rankTargets } from "./hacking-lib.ts";
 
 import {
   DEFAULT_CONFIG,
@@ -27,6 +27,7 @@ import {
   RECEIPT_STATUS,
   createInFlightLedger,
   createLedger,
+  clearGroupFault,
   fromUnits,
   isLiveStatus,
   pruneTerminalReceipts,
@@ -39,6 +40,8 @@ import {
 
 import {
   PHASE,
+  canRefill,
+  continuationWindow,
   createTargetRecord,
   decide,
   reduceTarget,
@@ -65,11 +68,7 @@ import type {
   WorkerCosts,
 } from "./multi-planning.ts";
 
-import type {
-  Decision,
-  TargetEvent,
-  TargetRecord,
-} from "./multi-scheduler.ts";
+import type { Decision, TargetEvent, TargetRecord } from "./multi-scheduler.ts";
 
 import type { RecoveredWorker } from "./multi-runtime.ts";
 
@@ -85,6 +84,8 @@ type ManagerConfig = SchedulerConfig & {
   hackFraction: number;
   minimumHackFraction: number;
   launchSafetyMs: number;
+  refillCommitCap: number;
+  refillBudgetMs: number;
 };
 
 type ManagerState = {
@@ -103,6 +104,9 @@ type ManagerState = {
   lastCommit: string;
   rooted: number;
   deployed: number;
+  sizingCapacityRam: number;
+  workersAvailableHosts: Set<string>;
+  nextFullReceiptSweep: number;
 };
 
 export async function main(ns: NS): Promise<void> {
@@ -118,34 +122,63 @@ export async function main(ns: NS): Promise<void> {
   if (conflict) return refuseToStart(ns, conflict);
 
   const state = createState();
-  refreshNetwork(ns, state, config);
+  refreshNetwork(ns, state, config, workers);
   adoptRecoveredWork(ns, state, config);
 
   if (config.report) return printReport(ns, state, config, workers);
 
   while (true) {
-    const now = Date.now();
+    let now = Date.now();
 
     if (now >= state.nextInfrastructureRefresh)
-      refreshNetwork(ns, state, config);
+      refreshNetwork(ns, state, config, workers);
 
     reconcileReceipts(ns, state, config, now);
     reconcileTargets(state, config, now);
 
-    const snapshots = snapshotRunners(readRunners(ns, state.hosts), config);
-    observeTargets(ns, state, config, workers, snapshots, now);
-
-    const decision = decide({
-      targets: [...state.targets.values()],
-      snapshots,
-      inFlight: state.inFlight,
-      workers,
+    let snapshots = snapshotRunners(
+      readRunners(ns, state.hosts, state.workersAvailableHosts),
       config,
-      now,
-      serial: state.serial,
-    });
+    );
+    observeTargets(ns, state, config, workers, now);
 
-    commitDecision(ns, state, decision, config, now);
+    const refillStartedAt = Date.now();
+    let commits = 0;
+    let decision: Decision;
+
+    while (true) {
+      now = Date.now();
+      decision = decide({
+        targets: [...state.targets.values()],
+        snapshots,
+        inFlight: state.inFlight,
+        workers,
+        config,
+        now,
+        serial: state.serial,
+      });
+
+      recordBatchSizingRejections(state, decision, config, now);
+      const committed = commitDecision(ns, state, decision, config, now);
+      if (!committed) break;
+
+      commits++;
+      snapshots = snapshotRunners(
+        readRunners(ns, state.hosts, state.workersAvailableHosts),
+        config,
+      );
+      if (
+        !canRefill({
+          commits,
+          elapsedMs: Date.now() - refillStartedAt,
+          commitCap: config.refillCommitCap,
+          wallClockBudgetMs: config.refillBudgetMs,
+        })
+      ) {
+        break;
+      }
+    }
+
     renderStatus(ns, state, config, snapshots, decision);
 
     await ns.sleep(nextWakeDelay(state, config, Date.now()));
@@ -173,6 +206,9 @@ function createState(): ManagerState {
     lastCommit: "none yet",
     rooted: 0,
     deployed: 0,
+    sizingCapacityRam: 0,
+    workersAvailableHosts: new Set(["home"]),
+    nextFullReceiptSweep: 0,
   };
 }
 
@@ -180,13 +216,20 @@ function refreshNetwork(
   ns: NS,
   state: ManagerState,
   config: ManagerConfig,
+  workers: WorkerCosts,
 ): void {
-  const result = refreshInfrastructure(ns, state.deployedHosts);
+  const result = refreshInfrastructure(
+    ns,
+    state.deployedHosts,
+    config.homeReserve,
+  );
   state.hosts = result.hosts;
   state.rooted = result.rooted;
   state.deployed = result.deployed;
+  state.sizingCapacityRam = result.sizingCapacityRam;
+  state.workersAvailableHosts = result.workersAvailableHosts;
   state.nextInfrastructureRefresh = Date.now() + config.infrastructureMs;
-  syncTrackedTargets(ns, state, config);
+  syncTrackedTargets(ns, state, config, workers);
 }
 
 /**
@@ -197,11 +240,36 @@ function syncTrackedTargets(
   ns: NS,
   state: ManagerState,
   config: ManagerConfig,
+  workers: WorkerCosts,
 ): void {
-  const candidates = state.hosts
-    .filter((host) => isMoneyTarget(ns, host))
-    .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a))
-    .slice(0, config.maxTargets);
+  const ranked = rankTargets(
+    ns,
+    state.hosts,
+    workers,
+    config,
+    state.sizingCapacityRam,
+  );
+  const rankedHosts = new Set(ranked.map((row) => row.host));
+  const maxSecurityFallbacks = state.hosts
+    .filter(
+      (host) =>
+        !rankedHosts.has(host) &&
+        isMoneyTarget(ns, host) &&
+        ns.getServerSecurityLevel(host) >= 100,
+    )
+    .map((host) => ({
+      host,
+      score:
+        ns.getServerMaxMoney(host) /
+        Math.max(0.001, ns.getWeakenTime(host) / 1_000),
+    }));
+  const candidates = [
+    ...ranked.map((row) => ({ host: row.host, score: row.score })),
+    ...maxSecurityFallbacks,
+  ]
+    .sort((a, b) => b.score - a.score || a.host.localeCompare(b.host))
+    .slice(0, config.maxTargets)
+    .map((row) => row.host);
 
   for (const host of candidates) {
     if (!state.targets.has(host))
@@ -249,8 +317,10 @@ function reconcileReceipts(
   config: ManagerConfig,
   now: number,
 ): void {
-  const result = pollReceipts(ns, state.inFlight, config, now);
+  const fullSweep = now >= state.nextFullReceiptSweep;
+  const result = pollReceipts(ns, state.inFlight, config, now, fullSweep);
   state.inFlight = result.ledger;
+  if (fullSweep) state.nextFullReceiptSweep = now + 2_000;
 
   if (state.recovered.length === 0) return;
 
@@ -308,14 +378,23 @@ function reconcileTargets(
     if (owned.length === 0) continue;
     if (owned.some((receipt) => isLiveStatus(receipt.status))) continue;
 
-    const lost = owned.some(
-      (receipt) => receipt.status === RECEIPT_STATUS.LOST,
-    );
-    const event: TargetEvent = lost
-      ? { type: "timing-fault", reason: "a fragment disappeared early", now }
-      : { type: "receipts-terminal", now };
+    const fault = state.inFlight.groupFaults[record.activeGroupId];
+    const terminalFaults = (fault?.lost ?? 0) + (fault?.killed ?? 0);
+    const event: TargetEvent =
+      terminalFaults > 0 || record.dirtyReason
+        ? {
+            type: "timing-fault",
+            reason: record.dirtyReason
+              ? record.dirtyReason
+              : `${fault?.lost ?? 0} fragment(s) lost, ${
+                  fault?.killed ?? 0
+                } killed`,
+            now,
+          }
+        : { type: "receipts-terminal", now };
 
     state.targets.set(host, reduceTarget(record, event, config));
+    state.inFlight = clearGroupFault(state.inFlight, record.activeGroupId);
   }
 
   state.inFlight = pruneTerminalReceipts(state.inFlight);
@@ -330,14 +409,8 @@ function observeTargets(
   state: ManagerState,
   config: ManagerConfig,
   workers: WorkerCosts,
-  snapshots: RunnerSnapshot[],
   now: number,
 ): void {
-  const usableRam = snapshots.reduce(
-    (sum, runner) => sum + runner.allocatableRam,
-    0,
-  );
-
   for (const [host, record] of state.targets) {
     if (record.activeGroupId !== null) continue;
     if (targetHasLiveReceipts(state.inFlight, host)) continue;
@@ -353,8 +426,22 @@ function observeTargets(
       continue;
 
     const observation = observeTarget(ns, host, now);
+    const targetConfig = {
+      ...config,
+      hackFraction: Math.max(
+        config.minimumHackFraction,
+        config.hackFraction * Math.pow(0.8, record.batchSizeNotches),
+      ),
+    };
     const economics = observation.valid
-      ? computeEconomics(ns, observation, host, workers, config, usableRam)
+      ? computeEconomics(
+          ns,
+          observation,
+          host,
+          workers,
+          targetConfig,
+          state.sizingCapacityRam,
+        )
       : null;
 
     state.targets.set(
@@ -368,14 +455,36 @@ function observeTargets(
   }
 }
 
+function recordBatchSizingRejections(
+  state: ManagerState,
+  decision: Decision,
+  config: ManagerConfig,
+  now: number,
+): void {
+  const rejected = new Set(
+    decision.reasons
+      .filter((reason) => reason.code === IDLE_REASON.COMPLETE_BATCH_TOO_LARGE)
+      .map((reason) => reason.host),
+  );
+
+  for (const host of rejected) {
+    const record = state.targets.get(host);
+    if (!record || record.activeGroupId !== null) continue;
+    state.targets.set(
+      host,
+      reduceTarget(record, { type: "batch-too-large", now }, config),
+    );
+  }
+}
+
 function commitDecision(
   ns: NS,
   state: ManagerState,
   decision: Decision,
   config: ManagerConfig,
   now: number,
-): void {
-  if (decision.kind === "idle") return;
+): boolean {
+  if (decision.kind === "idle") return false;
 
   const { group, allocations } = decision;
 
@@ -384,13 +493,13 @@ function commitDecision(
     state.lastCommit =
       `DRY RUN would launch ${describeDecision(decision)} ` +
       `(${allocations.length} fragments)`;
-    return;
+    return false;
   }
 
   const record = state.targets.get(decision.target);
-  if (!record) return;
+  if (!record) return false;
 
-  const result = commitGroup(ns, group, allocations, config);
+  const result = commitGroup(ns, group, allocations, config, record.generation);
 
   if (!result.ok) {
     state.launchFailures++;
@@ -399,11 +508,15 @@ function commitDecision(
       decision.target,
       reduceTarget(
         record,
-        { type: "launch-failed", reason: result.reason, now },
+        {
+          type: group.continuation ? "continuation-failed" : "launch-failed",
+          reason: result.reason,
+          now,
+        },
         config,
       ),
     );
-    return;
+    return false;
   }
 
   state.inFlight = publishGroup(
@@ -422,6 +535,7 @@ function commitDecision(
         type: "group-committed",
         groupId: group.id,
         purpose: group.purpose === "batch" ? "batch" : "prep",
+        batchCount: group.batchCount,
         now,
       },
       config,
@@ -431,6 +545,7 @@ function commitDecision(
   state.serial++;
   state.launched++;
   state.lastCommit = `${describeDecision(decision)} on ${result.pids.length} pid(s)`;
+  return true;
 }
 
 /**
@@ -454,6 +569,10 @@ function nextWakeDelay(
       earliest = Math.min(earliest, record.settleAfter);
     if (record.phase === PHASE.BACKOFF)
       earliest = Math.min(earliest, record.backoffUntil);
+    const continuation = continuationWindow(record, state.inFlight, config);
+    if (continuation && continuation.launchAt > now) {
+      earliest = Math.min(earliest, continuation.launchAt);
+    }
   }
   earliest = Math.min(earliest, state.nextInfrastructureRefresh);
 
@@ -487,10 +606,7 @@ function renderStatus(
   state.loops++;
   ns.clearLog();
 
-  const usable = snapshots.reduce(
-    (sum, runner) => sum + runner.allocatableRam,
-    0,
-  );
+  const usable = state.sizingCapacityRam;
   const free = fromUnits(totalUnits(createLedger(snapshots)));
   const inFlightRam = fromUnits(
     state.inFlight.receipts.reduce(
@@ -564,6 +680,8 @@ function renderInFlight(ns: NS, state: ManagerState): void {
       endsAt: number;
       target: string;
       late: number;
+      lost: number;
+      killed: number;
     }
   >();
 
@@ -574,11 +692,17 @@ function renderInFlight(ns: NS, state: ManagerState): void {
       endsAt: 0,
       target: receipt.target,
       late: 0,
+      lost: 0,
+      killed: 0,
     };
     entry.fragments++;
     entry.units += receipt.units;
     entry.endsAt = Math.max(entry.endsAt, receipt.expectedEndAt);
-    if (receipt.status === RECEIPT_STATUS.LATE) entry.late++;
+    const fault = state.inFlight.groupFaults[receipt.groupId];
+    entry.late =
+      fault?.late ?? (receipt.status === RECEIPT_STATUS.LATE ? 1 : 0);
+    entry.lost = fault?.lost ?? 0;
+    entry.killed = fault?.killed ?? 0;
     groups.set(receipt.groupId, entry);
   }
 
@@ -593,7 +717,9 @@ function renderInFlight(ns: NS, state: ManagerState): void {
         `${String(entry.fragments).padStart(3)} frag | ` +
         `${formatRam(fromUnits(entry.units)).padStart(10)} | ` +
         `ends in ${formatDuration(Math.max(0, entry.endsAt - now))}` +
-        (entry.late > 0 ? ` | ${entry.late} LATE` : ""),
+        (entry.late > 0 ? ` | ${entry.late} LATE` : "") +
+        (entry.lost > 0 ? ` | ${entry.lost} LOST` : "") +
+        (entry.killed > 0 ? ` | ${entry.killed} KILLED` : ""),
     );
   }
 
@@ -682,11 +808,11 @@ function printReport(
   workers: WorkerCosts,
 ): void {
   const now = Date.now();
-  const snapshots = snapshotRunners(readRunners(ns, state.hosts), config);
-  const usable = snapshots.reduce(
-    (sum, runner) => sum + runner.allocatableRam,
-    0,
+  const snapshots = snapshotRunners(
+    readRunners(ns, state.hosts, state.workersAvailableHosts),
+    config,
   );
+  const usable = state.sizingCapacityRam;
 
   for (const [host, record] of state.targets) {
     const observation = observeTarget(ns, host, now);
@@ -789,6 +915,8 @@ function readConfig(ns: NS): ManagerConfig {
     maxBatches: Math.max(1, Math.floor(Number(flags.batches) || 20)),
     launchLead: Math.max(250, Math.floor(Number(flags.lead) || 1_000)),
     launchSafetyMs: 250,
+    refillCommitCap: 4,
+    refillBudgetMs: 500,
     infrastructureMs: Math.max(5, Number(flags.infra) || 15) * 1_000,
     observationTtlMs: Math.max(1, Number(flags.ttl) || 5) * 1_000,
     pollCapMs: 1_000,
@@ -824,4 +952,3 @@ manager.ts stays the single-target fallback. This script refuses to start while
 manager.ts is running, and never kills it.
 `);
 }
-

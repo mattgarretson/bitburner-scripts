@@ -57,7 +57,7 @@ processes without changing worker behavior — and it is why the workers must
 stay at one `ns` call each: script RAM is charged per referenced API, per
 thread.
 
-Two existing functions are deliberately *not* reused:
+Two existing functions are deliberately _not_ reused:
 
 - `allocateJobs()` reads live Netscript state (`freeRam`) during allocation, so
   its result is not a pure function of a snapshot.
@@ -194,7 +194,9 @@ occurred.
 The runtime adapter takes one runner snapshot per loop:
 
 ```js
-{ host, maxRam, usedRam, homeReserve, allocatableRam, workersAvailable }
+{
+  (host, maxRam, usedRam, homeReserve, allocatableRam, workersAvailable);
+}
 ```
 
 For `home`, `allocatableRam` is `max(0, maxRam - usedRam - configuredHomeReserve)`.
@@ -241,8 +243,11 @@ uncertain receipt and its settlement time has passed. If a server becomes
 invalid while jobs are in flight, the scheduler keeps tracking those jobs, then
 observes and classifies it; it does not discard receipts.
 
-Only one of `PREP_IN_FLIGHT` or `BATCH_IN_FLIGHT` may exist per target. Other
-targets continue through their own state machines while that target is locked.
+Only one of `PREP_IN_FLIGHT` or `BATCH_IN_FLIGHT` may exist per target. A
+`BATCH_IN_FLIGHT` target may own several committed wave segments under one
+logical group id; every segment uses the same observation generation and lands
+strictly after the previous segment. Other targets continue through their own
+state machines while that target is locked.
 
 ## Scheduling policy
 
@@ -301,8 +306,11 @@ Three concepts stay strictly separate:
 
 Guards against stale-state scheduling:
 
-1. **Target lock:** no second group is planned for a target with any committed
-   or uncertain receipt.
+1. **Target lock:** no unrelated group is planned for a target with any
+   committed or uncertain receipt. A batch continuation is the sole exception:
+   it extends the same logical group, uses the same generation, contains only
+   complete H/W1/G/W2 batches, and starts its landing sequence after the
+   existing chain tail.
 2. **Fresh-observation barrier:** every finished, killed, lost, or late group
    leads to `NEEDS_OBSERVATION`; predicted effects never lead to `BATCH_READY`.
 3. **Generation token:** a group is valid only for the exact observation that
@@ -314,13 +322,41 @@ Guards against stale-state scheduling:
    is still within money/security tolerances.
 6. **Commit-time RAM check:** runner free RAM, home reserve, and worker
    availability are rechecked against the allocation.
-7. **Closed-group timing:** the only future state assumed during launch is the
-   planned landing order within that group. No later group builds on it.
+7. **Bounded chain timing:** future state may be assumed only across complete
+   batches in the same logical batch chain. A continuation is planned close to
+   its launch window, never overlaps the existing landing tail, and never
+   changes generation. Prep and unrelated work may not build on predicted
+   target state.
 8. **Post-group settlement:** the target is not observed until all fragments
    have stopped and the completion buffer has elapsed.
 
 Hack success is probabilistic, so even a perfectly timed batch may not restore
 predicted money. That is expected; the fresh observation picks the next phase.
+
+### Continuous batch-chain invariant
+
+An initial batch wave and its follow-on segments form one logical group. The
+group remains locked until every receipt from every segment is terminal.
+Segments may be appended without re-observation only when:
+
+1. the target remains `BATCH_IN_FLIGHT`;
+2. the observation generation still matches the chain;
+3. the chain has no recorded `LOST` or `KILLED` fault and no unresolved
+   `LATE` receipt;
+4. commit-time target and runner validation succeeds;
+5. the new segment contains complete batches and its first hack lands at least
+   one configured gap after the prior tail.
+
+Every segment receives unique batch/job identifiers even though the logical
+group id is shared. Faults are retained at group scope, so receipt pruning
+cannot erase a fault from an earlier segment. When the final segment finishes,
+the target still settles and returns to `NEEDS_OBSERVATION`; predicted effects
+never transition it directly to ready.
+
+Grow jobs may be split across runners. Because fragments complete sequentially
+and raise security, a split grow can under-deliver relative to a single-call
+analysis. The scheduler does not predict around that drift: it keeps the target
+locked, then relies on the mandatory post-chain observation and prep path.
 
 ## Atomic launch and rollback
 
@@ -380,21 +416,21 @@ distinguishes:
 - scheduler-free RAM allocated by the current decision; and
 - scheduler-free RAM left idle.
 
-| Code | Meaning |
-| --- | --- |
-| `NO_ELIGIBLE_TARGETS` | No rooted money target is currently eligible. |
-| `ALL_TARGETS_BUSY` | Every useful target has a group in flight or is settling. |
-| `WAITING_FOR_OBSERVATION` | A target cannot be classified safely yet. |
-| `NO_PROFITABLE_BATCH` | Ready targets exist, but none passes the profitability rules. |
-| `COMPLETE_BATCH_TOO_LARGE` | No complete H/W/G/W batch fits current free RAM. |
-| `PREP_GROUP_TOO_LARGE` | Neither a weaken prep nor a grow/weaken prep group fits. |
-| `RUNNER_FRAGMENTATION` | Aggregate RAM suffices but per-runner thread placement does not. |
-| `RESERVED_FOR_BATCH_WINDOW` | Prep would delay an already-ready complete batch. |
-| `WORKERS_NOT_DEPLOYED` | Nominal runner RAM is unavailable until deployment succeeds. |
-| `STALE_SNAPSHOT` | Target or runner data changed during plan/commit validation. |
-| `LAUNCH_BACKOFF` | A recent launch/timing failure is being reconciled. |
-| `CONFLICTING_MANAGER` | Another manager instance owns scheduling. |
-| `BELOW_SMALLEST_THREAD` | Remaining fragments cannot fit one worker thread. |
+| Code                        | Meaning                                                          |
+| --------------------------- | ---------------------------------------------------------------- |
+| `NO_ELIGIBLE_TARGETS`       | No rooted money target is currently eligible.                    |
+| `ALL_TARGETS_BUSY`          | Every useful target has a group in flight or is settling.        |
+| `WAITING_FOR_OBSERVATION`   | A target cannot be classified safely yet.                        |
+| `NO_PROFITABLE_BATCH`       | Ready targets exist, but none passes the profitability rules.    |
+| `COMPLETE_BATCH_TOO_LARGE`  | No complete H/W/G/W batch fits current free RAM.                 |
+| `PREP_GROUP_TOO_LARGE`      | Neither a weaken prep nor a grow/weaken prep group fits.         |
+| `RUNNER_FRAGMENTATION`      | Aggregate RAM suffices but per-runner thread placement does not. |
+| `RESERVED_FOR_BATCH_WINDOW` | Prep would delay an already-ready complete batch.                |
+| `WORKERS_NOT_DEPLOYED`      | Nominal runner RAM is unavailable until deployment succeeds.     |
+| `STALE_SNAPSHOT`            | Target or runner data changed during plan/commit validation.     |
+| `LAUNCH_BACKOFF`            | A recent launch/timing failure is being reconciled.              |
+| `CONFLICTING_MANAGER`       | Another manager instance owns scheduling.                        |
+| `BELOW_SMALLEST_THREAD`     | Remaining fragments cannot fit one worker thread.                |
 
 The display states both quantity and cause:
 
@@ -410,34 +446,34 @@ with a short count; per-candidate detail belongs in the tail log or report mode.
 
 ## Timing failure modes
 
-| Failure mode | Detection | Safe response |
-| --- | --- | --- |
-| Planning or `exec` takes longer than the launch lead | Compare now against the group's latest safe launch time before every `exec` | Abort before launch, or roll back the group and raise the lead. |
-| Launch skew exceeds a worker's requested delay | Worker delay clamps to zero; runtime safety margin exhausted | Do not launch the fragment; roll back the group and re-observe. |
-| Event-loop pause or UI lag collapses H/W/G/W landing gaps | Receipt timestamps pass expected boundaries; configured gap below observed jitter | Mark timing fault, wait for all jobs, re-observe, report the gap/lead as unsafe. |
-| Hacking level or security changes operation durations after planning | Commit-time metrics differ, or a job stays live outside tolerance | Reject the stale plan, or quarantine the completed group and re-observe. |
-| Split fragments of one logical job finish at slightly different times | Track every fragment, not one logical PID | Keep the target locked through the last fragment plus settlement buffer. |
-| System/browser clock changes (`Date.now()`) | Time moves backward or jumps unexpectedly relative to the last loop | Stop new launches, classify active groups as timing-uncertain, reconcile, re-observe. |
-| Completion buffer too short for state visibility | Repeated post-group observations disagree immediately | Increase buffer/backoff; never schedule from the disputed observation. |
-| A process runs materially later than planned | PID live after expected end plus tolerance | Mark `late`, keep its RAM and target locked, display the overrun. |
+| Failure mode                                                          | Detection                                                                         | Safe response                                                                         |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Planning or `exec` takes longer than the launch lead                  | Compare now against the group's latest safe launch time before every `exec`       | Abort before launch, or roll back the group and raise the lead.                       |
+| Launch skew exceeds a worker's requested delay                        | Worker delay clamps to zero; runtime safety margin exhausted                      | Do not launch the fragment; roll back the group and re-observe.                       |
+| Event-loop pause or UI lag collapses H/W/G/W landing gaps             | Receipt timestamps pass expected boundaries; configured gap below observed jitter | Mark timing fault, wait for all jobs, re-observe, report the gap/lead as unsafe.      |
+| Hacking level or security changes operation durations after planning  | Commit-time metrics differ, or a job stays live outside tolerance                 | Reject the stale plan, or quarantine the completed group and re-observe.              |
+| Split fragments of one logical job finish at slightly different times | Track every fragment, not one logical PID                                         | Keep the target locked through the last fragment plus settlement buffer.              |
+| System/browser clock changes (`Date.now()`)                           | Time moves backward or jumps unexpectedly relative to the last loop               | Stop new launches, classify active groups as timing-uncertain, reconcile, re-observe. |
+| Completion buffer too short for state visibility                      | Repeated post-group observations disagree immediately                             | Increase buffer/backoff; never schedule from the disputed observation.                |
+| A process runs materially later than planned                          | PID live after expected end plus tolerance                                        | Mark `late`, keep its RAM and target locked, display the overrun.                     |
 
 ## State-consistency and launch failure modes
 
-| Failure mode | Detection | Safe response |
-| --- | --- | --- |
-| Runner RAM changes between snapshot and launch | Commit-time free-RAM check, or `ns.exec` returns zero | Launch nothing if caught early; otherwise kill all fragments in the group and replan. |
-| One fragment fails after earlier fragments launched | `ns.exec` returns zero partway through | Kill all recorded PIDs, verify rollback, mark target dirty, require observation. |
-| Rollback loses a race with an operation starting or finishing | Kill fails, PID vanishes unexpectedly, or lead expired | Assume target state may have changed; quarantine until receipts settle, then observe. |
-| Worker manually killed or runner disappears | PID gone before expected completion | Mark `lost`; do not apply its predicted effect or launch more work on that target. |
-| Hack outcomes differ from expectation | Fresh money observation differs from the planning model | Reclassify from observed state; usually money or security prep. |
-| Another script mutates a target | Observation changes with no matching receipt, or a foreign worker targets it | Invalidate the generation, quarantine and re-observe, report interference. |
-| Target state changes after observation but before commit | Commit-time money/security/readiness check differs | Discard the candidate without launching. |
-| Target becomes invalid, unrooted, or inaccessible | Target validation fails | Track existing receipts to terminal state, then mark unavailable. |
-| Worker deployment missing or script RAM changed | Deployment/file/RAM preflight differs from snapshot | Exclude the runner, invalidate allocations, refresh infrastructure, replan. |
-| Manager restarts while tagged workers run | Startup `ns.ps` scan finds the multi-manager prefix | Recover receipts conservatively, wait for completion, then observe. |
-| `manager.js` and `multi-manager.js` overlap | Startup and periodic process scan | Launch nothing, report `CONFLICTING_MANAGER`, never kill the fallback. |
-| Growth analysis returns non-finite or impossible values | Validate all computed threads, RAM, times, expected value | Reject the candidate with a calculation reason; never coerce a partial group. |
-| Target ranking goes stale as player stats change | Ranking generation/TTL expires | Recompute before selecting or committing work. |
+| Failure mode                                                  | Detection                                                                    | Safe response                                                                         |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Runner RAM changes between snapshot and launch                | Commit-time free-RAM check, or `ns.exec` returns zero                        | Launch nothing if caught early; otherwise kill all fragments in the group and replan. |
+| One fragment fails after earlier fragments launched           | `ns.exec` returns zero partway through                                       | Kill all recorded PIDs, verify rollback, mark target dirty, require observation.      |
+| Rollback loses a race with an operation starting or finishing | Kill fails, PID vanishes unexpectedly, or lead expired                       | Assume target state may have changed; quarantine until receipts settle, then observe. |
+| Worker manually killed or runner disappears                   | PID gone before expected completion                                          | Mark `lost`; do not apply its predicted effect or launch more work on that target.    |
+| Hack outcomes differ from expectation                         | Fresh money observation differs from the planning model                      | Reclassify from observed state; usually money or security prep.                       |
+| Another script mutates a target                               | Observation changes with no matching receipt, or a foreign worker targets it | Invalidate the generation, quarantine and re-observe, report interference.            |
+| Target state changes after observation but before commit      | Commit-time money/security/readiness check differs                           | Discard the candidate without launching.                                              |
+| Target becomes invalid, unrooted, or inaccessible             | Target validation fails                                                      | Track existing receipts to terminal state, then mark unavailable.                     |
+| Worker deployment missing or script RAM changed               | Deployment/file/RAM preflight differs from snapshot                          | Exclude the runner, invalidate allocations, refresh infrastructure, replan.           |
+| Manager restarts while tagged workers run                     | Startup `ns.ps` scan finds the multi-manager prefix                          | Recover receipts conservatively, wait for completion, then observe.                   |
+| `manager.js` and `multi-manager.js` overlap                   | Startup and periodic process scan                                            | Launch nothing, report `CONFLICTING_MANAGER`, never kill the fallback.                |
+| Growth analysis returns non-finite or impossible values       | Validate all computed threads, RAM, times, expected value                    | Reject the candidate with a calculation reason; never coerce a partial group.         |
+| Target ranking goes stale as player stats change              | Ranking generation/TTL expires                                               | Recompute before selecting or committing work.                                        |
 
 ## Tests that do not require Bitburner
 
@@ -446,7 +482,8 @@ Most correctness rules live in pure modules and run under Node.
 ### Pure scheduler tests
 
 - Targets transition independently; events for target A never change target B.
-- A target with an active or uncertain receipt produces no new candidate.
+- A target with an active or uncertain receipt produces no unrelated candidate;
+  a valid batch-chain continuation is the tested exception.
 - A terminal group always passes through settlement and fresh observation before
   becoming ready.
 - Stale generations and expired observations are rejected.
@@ -526,16 +563,16 @@ Three consequences for the layout above:
 
 ## Requirement traceability
 
-| Requirement | Design mechanism |
-| --- | --- |
-| Independent state machine per target | `TargetRecord`, reducer, one target lock per active group |
-| Global RAM allocation | One immutable runner snapshot and one private global ledger |
-| Complete profitable batches before prep | Two-pass candidate selection |
-| Prepare another target with idle RAM | Prep pass plus batch-window no-delay guard |
-| Track jobs in flight | Per-fragment process receipt ledger |
-| Never infer future state from current state | Generation tokens, explicit receipts, target lock, fresh-observation barrier |
-| Explain idle RAM | Structured allocation rejections and idle reason codes |
-| Keep `manager.js` fallback | Separate entry point and new modules; no fallback behavior changes |
-| Never launch partial batches | Atomic job groups, all-or-none allocation and rollback |
-| Preserve home RAM | Reserve removed in every runner snapshot and commit revalidation |
-| Test without Bitburner | Pure reducer/planner/allocator tests plus fake-NS adapter tests |
+| Requirement                             | Design mechanism                                                                                      |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Independent state machine per target    | `TargetRecord`, reducer, one target lock per active group                                             |
+| Global RAM allocation                   | One immutable runner snapshot and one private global ledger                                           |
+| Complete profitable batches before prep | Two-pass candidate selection                                                                          |
+| Prepare another target with idle RAM    | Prep pass plus batch-window no-delay guard                                                            |
+| Track jobs in flight                    | Per-fragment process receipt ledger                                                                   |
+| Bound predicted state safely            | Generation tokens, explicit receipts, one logical batch chain, target lock, fresh-observation barrier |
+| Explain idle RAM                        | Structured allocation rejections and idle reason codes                                                |
+| Keep `manager.js` fallback              | Separate entry point and new modules; no fallback behavior changes                                    |
+| Never launch partial batches            | Atomic job groups, all-or-none allocation and rollback                                                |
+| Preserve home RAM                       | Reserve removed in every runner snapshot and commit revalidation                                      |
+| Test without Bitburner                  | Pure reducer/planner/allocator tests plus fake-NS adapter tests                                       |

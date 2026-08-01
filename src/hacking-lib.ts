@@ -16,6 +16,8 @@ export const WORKER_FILES = {
 // live growthAnalyze() result to the same server at minimum security.
 const SERVER_BASE_GROWTH_INCR = 0.03;
 const SERVER_MAX_GROWTH_LOG = 0.00349388925425578;
+const HACK_TIME_DIFF_FACTOR = 2.5;
+const HACK_TIME_BASE_DIFF = 500;
 
 export type WorkerFile = { file: string; ram: number };
 export type Workers = {
@@ -31,6 +33,7 @@ export type Config = {
   landingGap: number;
   maxBatches: number;
   launchLead: number;
+  growSafetyMargin?: number;
 };
 
 export type NetworkStats = {
@@ -393,11 +396,9 @@ export function buildPreparedBatch(
     if (actualFraction <= 0 || actualFraction >= 0.9) continue;
 
     const growMultiplier = 1 / (1 - actualFraction);
-    const growThreads = Math.max(
-      1,
-      Math.ceil(
-        growthThreadsAtSecurity(ns, host, growMultiplier, metrics.minSecurity),
-      ),
+    const growThreads = applyGrowSafetyMargin(
+      growthThreadsAtSecurity(ns, host, growMultiplier, metrics.minSecurity),
+      config.growSafetyMargin ?? 0,
     );
     const weakenHackThreads = weakenThreadsForHack(ns, hackThreads);
     const weakenGrowThreads = weakenThreadsForGrow(ns, growThreads);
@@ -430,11 +431,33 @@ export function buildPreparedBatch(
   return null;
 }
 
+export function applyGrowSafetyMargin(threads: number, margin: number): number {
+  if (!Number.isFinite(threads)) return threads;
+  return Math.max(1, Math.ceil(threads * (1 + Math.max(0, margin))));
+}
+
+export function hackTimeScale(
+  requiredSkill: number | null | undefined,
+  fromSecurity: number,
+  toSecurity: number,
+): number {
+  const skill =
+    typeof requiredSkill === "number" && Number.isFinite(requiredSkill)
+      ? Math.max(0, requiredSkill)
+      : 0;
+  const from = Math.max(0, fromSecurity);
+  const to = Math.max(0, toSecurity);
+  const at = (security: number): number =>
+    HACK_TIME_DIFF_FACTOR * skill * security + HACK_TIME_BASE_DIFF;
+  return at(to) / at(from);
+}
+
 function getPreparedMetrics(ns: NS, host: string): PreparedMetrics | null {
   const server = ns.getServer(host);
   const maxMoney = server.moneyMax ?? 0;
   const currentSecurity = server.hackDifficulty ?? 100;
   const minSecurity = server.minDifficulty ?? currentSecurity;
+  const requiredLevel = server.requiredHackingSkill;
 
   if (maxMoney <= 0 || currentSecurity >= 100 || minSecurity <= 0) return null;
 
@@ -442,8 +465,8 @@ function getPreparedMetrics(ns: NS, host: string): PreparedMetrics | null {
   const successScale =
     (100 - minSecurity) / Math.max(0.000001, 100 - currentSecurity);
 
-  // H/G/W time is linear in security.
-  const timeScale = minSecurity / Math.max(minSecurity, currentSecurity);
+  // H/G/W time shares the same affine difficulty factor.
+  const timeScale = hackTimeScale(requiredLevel, currentSecurity, minSecurity);
 
   return {
     maxMoney,
@@ -874,11 +897,7 @@ function isHackableMoneyServer(ns: NS, host: string): boolean {
 }
 
 /** Shared by every script that reads a numeric flag; non-finite input floors. */
-export function clamp(
-  value: number,
-  minimum: number,
-  maximum: number,
-): number {
+export function clamp(value: number, minimum: number, maximum: number): number {
   if (!Number.isFinite(value)) return minimum;
   return Math.min(maximum, Math.max(minimum, value));
 }

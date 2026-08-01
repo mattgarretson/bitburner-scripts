@@ -16,6 +16,7 @@ import {
   commitGroup,
   detectConflictingManager,
   pollReceipts,
+  readRunners,
   recoverTaggedProcesses,
 } from "../src/multi-runtime.ts";
 
@@ -53,6 +54,15 @@ function fakeNs(overrides = {}) {
     hasRootAccess: () => true,
     getServerMaxRam: () => 1024,
     getServerUsedRam: () => 0,
+    fileExists: () => true,
+    getServer: () => ({
+      hasAdminRights: true,
+      purchasedByPlayer: false,
+      moneyAvailable: 1_000_000,
+      moneyMax: 1_000_000,
+      hackDifficulty: 1,
+      minDifficulty: 1,
+    }),
     isRunning: () => true,
     exec: () => 1,
     kill: () => true,
@@ -94,7 +104,13 @@ test("a successful commit execs every fragment in delay order", () => {
     },
   });
 
-  const result = commitGroup(ns, group, allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, true);
   assert.equal(result.pids.length, allocations.length);
@@ -117,7 +133,13 @@ test("plannedAt is stamped into argument 2 so workers can subtract launch skew",
     },
   });
 
-  const result = commitGroup(ns, group, allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, true);
   for (const value of stamped) assert.equal(value, result.plannedAt);
@@ -141,7 +163,13 @@ test("a failed exec partway through kills every PID already launched", () => {
     isRunning: () => false,
   });
 
-  const result = commitGroup(ns, group, allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, false);
   assert.match(result.reason, /exec failed/);
@@ -165,7 +193,13 @@ test("a commit is refused when runner free RAM changed during planning", () => {
     },
   });
 
-  const result = commitGroup(ns, group, allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, false);
   assert.match(result.reason, /free RAM changed/);
@@ -183,7 +217,13 @@ test("a commit is refused when planning consumed the launch lead", () => {
     },
   });
 
-  const result = commitGroup(ns, group, allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, false);
   assert.match(result.reason, /lead/);
@@ -212,10 +252,80 @@ test("the home reserve is honoured at commit time", () => {
     getServerUsedRam: () => 43.5,
   });
 
-  const result = commitGroup(ns, group, allocation.allocations, CONFIG);
+  const result = commitGroup(
+    ns,
+    group,
+    allocation.allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
 
   assert.equal(result.ok, false);
   assert.match(result.reason, /free RAM changed/);
+});
+
+test("a commit is refused when the target generation changed", () => {
+  const { group, allocations } = plannedGroup();
+  let execCalls = 0;
+  const ns = fakeNs({
+    exec: () => {
+      execCalls++;
+      return 1;
+    },
+  });
+
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration + 1,
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /generation moved/);
+  assert.equal(execCalls, 0);
+});
+
+test("a commit is refused when target readiness changed", () => {
+  const { group, allocations } = plannedGroup();
+  const ns = fakeNs({
+    getServer: () => ({
+      hasAdminRights: true,
+      purchasedByPlayer: false,
+      moneyAvailable: 100,
+      moneyMax: 1_000_000,
+      hackDifficulty: 1,
+      minDifficulty: 1,
+    }),
+  });
+
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /target state moved/);
+});
+
+test("a commit is refused when worker files disappeared", () => {
+  const { group, allocations } = plannedGroup();
+  const ns = fakeNs({ fileExists: () => false });
+
+  const result = commitGroup(
+    ns,
+    group,
+    allocations,
+    CONFIG,
+    group.targetGeneration,
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /worker files changed/);
 });
 
 // -----------------------------------------------------------------------------
@@ -280,6 +390,54 @@ test("a receipt running past its late tolerance is marked late", () => {
   for (const receipt of result.ledger.receipts) {
     assert.equal(receipt.status, RECEIPT_STATUS.LATE);
   }
+});
+
+test("receipt polling skips future completions between full sweeps", () => {
+  const { group, allocations } = plannedGroup();
+  const now = Date.now();
+  const inFlight = publishGroup(
+    createInFlightLedger(),
+    group,
+    allocations,
+    allocations.map((_, index) => 100 + index),
+    now,
+  );
+  let polls = 0;
+  const ns = fakeNs({
+    isRunning: () => {
+      polls++;
+      return true;
+    },
+  });
+
+  pollReceipts(ns, inFlight, CONFIG, now + 100, false);
+  assert.equal(polls, 0);
+
+  pollReceipts(ns, inFlight, CONFIG, now + 100, true);
+  assert.equal(polls, inFlight.receipts.length);
+});
+
+test("runner reads use cached worker availability without file probes", () => {
+  let fileChecks = 0;
+  const ns = fakeNs({
+    fileExists: () => {
+      fileChecks++;
+      return true;
+    },
+  });
+
+  const runners = readRunners(
+    ns,
+    ["home", "alpha"],
+    new Set(["home", "alpha"]),
+  );
+
+  assert.equal(runners.length, 2);
+  assert.equal(fileChecks, 0);
+  assert.equal(
+    runners.every((runner) => runner.workersAvailable),
+    true,
+  );
 });
 
 // -----------------------------------------------------------------------------

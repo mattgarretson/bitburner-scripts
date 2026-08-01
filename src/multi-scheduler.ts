@@ -11,6 +11,7 @@ import {
   IDLE_REASON,
   createLedger,
   earliestReleaseTime,
+  isLiveStatus,
   planLargestMoneyPrep,
   planLargestSecurityPrep,
   planLargestWave,
@@ -66,6 +67,7 @@ export type Observation = {
 export type TargetEconomics = {
   preparedBatch: BatchSpec | null;
   expectedMoneyPerSecond: number;
+  prepPriority?: number;
   moneyPrep?: MoneyPrepSpec | null;
   securityPrep?: SecurityPrepSpec | null;
 };
@@ -81,6 +83,9 @@ export type TargetRecord = {
   backoffUntil: number;
   dirtyReason: string | null;
   waitingSince: number;
+  batchTooLargeCount: number;
+  batchSizeNotches: number;
+  scheduledBatchCount: number;
 };
 
 /** Every event `reduceTarget` understands. */
@@ -90,7 +95,9 @@ export type TargetEventType =
   | "receipts-terminal"
   | "settled"
   | "launch-failed"
+  | "continuation-failed"
   | "timing-fault"
+  | "batch-too-large"
   | "backoff-elapsed";
 
 export type TargetEvent = {
@@ -100,6 +107,7 @@ export type TargetEvent = {
   economics?: TargetEconomics | null;
   groupId?: string;
   purpose?: "batch" | "prep";
+  batchCount?: number;
   reason?: string;
 };
 
@@ -132,6 +140,11 @@ export type DecideInput = {
 };
 
 type PrepPlanResult = MoneyPrepPlanResult | SecurityPrepPlanResult | null;
+type ContinuationWindow = { lastEndAt: number; launchAt: number };
+type BatchCandidate = {
+  record: TargetRecord;
+  continuation: ContinuationWindow | null;
+};
 
 export type BatchWindowInput = {
   prepGroup: JobGroup;
@@ -142,6 +155,27 @@ export type BatchWindowInput = {
 };
 
 export type BatchWindowResult = { allowed: boolean; detail?: string };
+
+export function canRefill(input: {
+  commits: number;
+  elapsedMs: number;
+  commitCap: number;
+  wallClockBudgetMs: number;
+}): boolean {
+  return (
+    input.commits < input.commitCap && input.elapsedMs < input.wallClockBudgetMs
+  );
+}
+
+export function preparedPrepPriority(
+  expectedMoneyPerSecond: number,
+  maxMoney: number,
+  weakenTime: number,
+): number {
+  return expectedMoneyPerSecond > 0
+    ? expectedMoneyPerSecond
+    : Math.max(0, maxMoney) / Math.max(0.001, weakenTime / 1_000);
+}
 
 export function createTargetRecord(host: string): TargetRecord {
   return {
@@ -155,6 +189,9 @@ export function createTargetRecord(host: string): TargetRecord {
     backoffUntil: 0,
     dirtyReason: null,
     waitingSince: 0,
+    batchTooLargeCount: 0,
+    batchSizeNotches: 0,
+    scheduledBatchCount: 0,
   };
 }
 
@@ -178,6 +215,41 @@ export function classifyObservation(
     return PHASE.MONEY_PREP_READY;
   }
   return PHASE.BATCH_READY;
+}
+
+export function isStillCommittable(input: {
+  group: JobGroup;
+  currentGeneration: number;
+  fresh: Observation;
+  config: SchedulerConfig;
+}): { ok: true } | { ok: false; reason: string } {
+  const { group, currentGeneration, fresh, config } = input;
+
+  if (group.targetGeneration !== currentGeneration) {
+    return {
+      ok: false,
+      reason:
+        `target generation moved from ${group.targetGeneration} ` +
+        `to ${currentGeneration}`,
+    };
+  }
+
+  const actual = classifyObservation(fresh, config);
+  const expected =
+    group.purpose === "batch"
+      ? PHASE.BATCH_READY
+      : group.purpose === "money-prep"
+        ? PHASE.MONEY_PREP_READY
+        : PHASE.SECURITY_PREP_READY;
+
+  if (actual !== expected) {
+    return {
+      ok: false,
+      reason: `target state moved from ${expected} to ${actual}`,
+    };
+  }
+
+  return { ok: true };
 }
 
 function isPrepPhase(record: TargetRecord): boolean {
@@ -208,6 +280,7 @@ export function reduceTarget(
         observation: event.observation,
         economics: event.economics ?? null,
         activeGroupId: null,
+        scheduledBatchCount: 0,
         dirtyReason: null,
         settleAfter: 0,
         waitingSince:
@@ -223,6 +296,14 @@ export function reduceTarget(
             ? PHASE.BATCH_IN_FLIGHT
             : PHASE.PREP_IN_FLIGHT,
         activeGroupId: event.groupId ?? null,
+        batchTooLargeCount:
+          event.purpose === "batch" ? 0 : record.batchTooLargeCount,
+        batchSizeNotches:
+          event.purpose === "batch" ? 0 : record.batchSizeNotches,
+        scheduledBatchCount:
+          event.purpose === "batch"
+            ? record.scheduledBatchCount + Math.max(0, event.batchCount ?? 0)
+            : record.scheduledBatchCount,
       };
     }
 
@@ -251,6 +332,27 @@ export function reduceTarget(
         activeGroupId: null,
         dirtyReason: event.reason ?? event.type,
         backoffUntil: event.now + (config.backoffMs ?? 5_000),
+      };
+    }
+
+    case "continuation-failed": {
+      return {
+        ...record,
+        dirtyReason: event.reason ?? event.type,
+      };
+    }
+
+    case "batch-too-large": {
+      const count = record.batchTooLargeCount + 1;
+      const nextNotches = Math.floor(count / 3);
+      return {
+        ...record,
+        batchTooLargeCount: count,
+        batchSizeNotches: nextNotches,
+        phase:
+          nextNotches > record.batchSizeNotches
+            ? PHASE.NEEDS_OBSERVATION
+            : record.phase,
       };
     }
 
@@ -307,6 +409,48 @@ function compareBatchCandidates(a: TargetRecord, b: TargetRecord): number {
   return bRate - aRate || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0);
 }
 
+export function continuationWindow(
+  record: TargetRecord,
+  inFlight: InFlightLedger,
+  config: SchedulerConfig,
+): ContinuationWindow | null {
+  const batch = record.economics?.preparedBatch;
+  const groupId = record.activeGroupId;
+  if (
+    record.phase !== PHASE.BATCH_IN_FLIGHT ||
+    !batch ||
+    record.dirtyReason !== null ||
+    groupId === null ||
+    groupId === "recovered"
+  ) {
+    return null;
+  }
+
+  const fault = inFlight.groupFaults[groupId];
+  if (
+    (fault?.lost ?? 0) > 0 ||
+    (fault?.late ?? 0) > 0 ||
+    (fault?.killed ?? 0) > 0
+  ) {
+    return null;
+  }
+
+  const live = inFlight.receipts.filter(
+    (receipt) =>
+      receipt.groupId === groupId &&
+      receipt.target === record.host &&
+      isLiveStatus(receipt.status),
+  );
+  if (live.length === 0) return null;
+
+  const lastEndAt = Math.max(...live.map((receipt) => receipt.expectedEndAt));
+  return {
+    lastEndAt,
+    launchAt:
+      lastEndAt + config.landingGap - config.launchLead - batch.weakenTime,
+  };
+}
+
 /**
  * Aged prep candidates are promoted ahead of richer but newer ones so a large
  * low-value target cannot starve a smaller useful one. This never lets prep
@@ -323,8 +467,10 @@ function makePrepComparator(
     const bAged = now - b.waitingSince >= aging ? 1 : 0;
     if (aAged !== bAged) return bAged - aAged;
 
-    const aRate = a.economics?.expectedMoneyPerSecond ?? 0;
-    const bRate = b.economics?.expectedMoneyPerSecond ?? 0;
+    const aRate =
+      a.economics?.prepPriority ?? a.economics?.expectedMoneyPerSecond ?? 0;
+    const bRate =
+      b.economics?.prepPriority ?? b.economics?.expectedMoneyPerSecond ?? 0;
     if (aRate !== bRate) return bRate - aRate;
 
     return (
@@ -356,9 +502,23 @@ export function decide(input: DecideInput): Decision {
   // Pass 1: complete profitable batches
   // ---------------------------------------------------------------------------
 
-  const batchCandidates: TargetRecord[] = [];
+  const batchCandidates: BatchCandidate[] = [];
 
   for (const record of targets) {
+    const continuation = continuationWindow(record, inFlight, config);
+    if (continuation) {
+      if (now >= continuation.launchAt) {
+        batchCandidates.push({ record, continuation });
+      } else {
+        reasons.push({
+          host: record.host,
+          code: IDLE_REASON.ALL_TARGETS_BUSY,
+          detail: `batch continuation opens at ${continuation.launchAt}`,
+        });
+      }
+      continue;
+    }
+
     const eligibility = checkEligibility(record, inFlight, config, now);
     if (!eligibility.eligible) {
       reasons.push({
@@ -380,14 +540,15 @@ export function decide(input: DecideInput): Decision {
       continue;
     }
 
-    batchCandidates.push(record);
+    batchCandidates.push({ record, continuation: null });
   }
 
-  batchCandidates.sort(compareBatchCandidates);
+  batchCandidates.sort((a, b) => compareBatchCandidates(a.record, b.record));
 
   let pendingBatch: BatchWindowInput["pendingBatch"] = null;
 
-  for (const record of batchCandidates) {
+  for (const candidate of batchCandidates) {
+    const { record, continuation } = candidate;
     const batch = record.economics?.preparedBatch;
     if (!batch) continue;
 
@@ -397,9 +558,24 @@ export function decide(input: DecideInput): Decision {
       workers,
       config,
       ledger,
-      groupId: `${tag}-b${serial}-${record.host}`,
+      groupId:
+        continuation && record.activeGroupId
+          ? record.activeGroupId
+          : `${tag}-b${serial}-${record.host}`,
       targetGeneration: record.generation,
       plannedAt: now,
+      batchIndexStart: continuation ? record.scheduledBatchCount : 0,
+      landingOffset: continuation
+        ? Math.max(
+            0,
+            continuation.lastEndAt +
+              config.landingGap -
+              now -
+              config.launchLead -
+              batch.weakenTime,
+          )
+        : 0,
+      continuation: continuation !== null,
     });
 
     if (result.ok) {
@@ -412,11 +588,19 @@ export function decide(input: DecideInput): Decision {
       };
     }
 
-    reasons.push({
-      host: record.host,
-      code: result.rejection.code,
-      detail: result.rejection.detail,
-    });
+    reasons.push(
+      continuation
+        ? {
+            host: record.host,
+            code: IDLE_REASON.RESERVED_FOR_BATCH_WINDOW,
+            detail: `continuation waits for RAM: ${result.rejection.detail}`,
+          }
+        : {
+            host: record.host,
+            code: result.rejection.code,
+            detail: result.rejection.detail,
+          },
+    );
 
     if (pendingBatch === null) {
       pendingBatch = {
@@ -533,9 +717,28 @@ function planPrep(
   };
 
   if (record.phase === PHASE.SECURITY_PREP_READY) {
-    const prep = record.economics?.securityPrep;
-    if (!prep || prep.threadsNeeded < 1) return null;
-    return planLargestSecurityPrep({ ...shared, prep });
+    const securityPrep = record.economics?.securityPrep;
+    if (!securityPrep || securityPrep.threadsNeeded < 1) return null;
+
+    const moneyPrep = record.economics?.moneyPrep;
+    if (
+      observation.money <
+        observation.maxMoney * (config.moneyReadyRatio ?? 0.999) &&
+      moneyPrep &&
+      moneyPrep.growThreadsNeeded > 0
+    ) {
+      const combined = planLargestMoneyPrep({
+        ...shared,
+        purpose: "security-prep",
+        prep: {
+          ...moneyPrep,
+          baseWeakenThreads: securityPrep.threadsNeeded,
+        },
+      });
+      if (combined.ok) return combined;
+    }
+
+    return planLargestSecurityPrep({ ...shared, prep: securityPrep });
   }
 
   const prep = record.economics?.moneyPrep;

@@ -9,6 +9,7 @@
 
 import {
   WORKER_FILES,
+  applyGrowSafetyMargin,
   buildPreparedBatch,
   deployWorkers,
   inspectTarget,
@@ -20,7 +21,9 @@ import {
   applyReceiptStatus,
   classifyReceipt,
   isLiveStatus,
+  stableSizingCapacity,
 } from "./multi-planning.ts";
+import { isStillCommittable, preparedPrepPriority } from "./multi-scheduler.ts";
 
 import type {
   Fragment,
@@ -59,6 +62,8 @@ export type InfrastructureRefresh = {
   hosts: string[];
   rooted: number;
   deployed: number;
+  sizingCapacityRam: number;
+  workersAvailableHosts: Set<string>;
 };
 
 export type CommitResult =
@@ -114,11 +119,46 @@ export function detectConflictingManager(ns: NS): string | null {
 export function refreshInfrastructure(
   ns: NS,
   deployedHosts: Set<string>,
+  homeReserve = 0,
 ): InfrastructureRefresh {
   const hosts = scanNetwork(ns);
   const rooted = rootAvailableServers(ns, hosts);
   const deployed = deployWorkers(ns, hosts, deployedHosts);
-  return { hosts, rooted, deployed };
+  const workerFiles: string[] = Object.values(WORKER_FILES);
+  const capacityInputs = hosts
+    .filter((host) => ns.hasRootAccess(host) && ns.getServerMaxRam(host) > 0)
+    .map((host) => {
+      const workersAvailable =
+        host === "home" ||
+        workerFiles.every((file) => ns.fileExists(file, host));
+      const foreignUsedRam = ns
+        .ps(host)
+        .filter((process) => !workerFiles.includes(process.filename))
+        .reduce(
+          (sum, process) =>
+            sum + process.threads * ns.getScriptRam(process.filename, host),
+          0,
+        );
+      return {
+        host,
+        maxRam: ns.getServerMaxRam(host),
+        foreignUsedRam,
+        workersAvailable,
+      };
+    });
+  const workersAvailableHosts = new Set(
+    capacityInputs
+      .filter((runner) => runner.workersAvailable)
+      .map((runner) => runner.host),
+  );
+
+  return {
+    hosts,
+    rooted,
+    deployed,
+    sizingCapacityRam: stableSizingCapacity(capacityInputs, homeReserve),
+    workersAvailableHosts,
+  };
 }
 
 /**
@@ -128,7 +168,11 @@ export function refreshInfrastructure(
  * @param {string[]} hosts
  * @returns {import("./multi-planning.ts").RunnerInput[]}
  */
-export function readRunners(ns: NS, hosts: string[]): RunnerInput[] {
+export function readRunners(
+  ns: NS,
+  hosts: string[],
+  workersAvailableHosts?: ReadonlySet<string>,
+): RunnerInput[] {
   const files = Object.values(WORKER_FILES);
 
   return hosts
@@ -138,7 +182,8 @@ export function readRunners(ns: NS, hosts: string[]): RunnerInput[] {
       maxRam: ns.getServerMaxRam(host),
       usedRam: ns.getServerUsedRam(host),
       workersAvailable:
-        host === "home" || files.every((file) => ns.fileExists(file, host)),
+        workersAvailableHosts?.has(host) ??
+        (host === "home" || files.every((file) => ns.fileExists(file, host))),
     }));
 }
 
@@ -250,7 +295,10 @@ export function computeEconomics(
   const growSecurityPerThread = ns.growthAnalyzeSecurity(1, undefined, 1);
 
   const multiplier = observation.maxMoney / Math.max(1, observation.money);
-  let growThreadsNeeded = Math.ceil(ns.growthAnalyze(host, multiplier, 1));
+  let growThreadsNeeded = applyGrowSafetyMargin(
+    ns.growthAnalyze(host, multiplier, 1),
+    config.growSafetyMargin ?? 0,
+  );
   if (!Number.isFinite(growThreadsNeeded) || growThreadsNeeded < 1) {
     growThreadsNeeded = 1;
   }
@@ -265,6 +313,11 @@ export function computeEconomics(
   return {
     preparedBatch,
     expectedMoneyPerSecond,
+    prepPriority: preparedPrepPriority(
+      expectedMoneyPerSecond,
+      observation.maxMoney,
+      observation.weakenTime,
+    ),
     moneyPrep: {
       growThreadsNeeded,
       growSecurityPerThread,
@@ -293,6 +346,7 @@ export function commitGroup(
   group: JobGroup,
   allocations: Fragment[],
   config: SchedulerConfig,
+  currentGeneration: number,
 ): CommitResult {
   const plannedAt = Date.now();
   const skew = plannedAt - group.plannedAt;
@@ -319,6 +373,55 @@ export function commitGroup(
     if (free + 1e-9 < ram) {
       return { ok: false, reason: `${host} free RAM changed during planning` };
     }
+  }
+
+  const files = Object.values(WORKER_FILES);
+  const allocationHosts = new Set(allocations.map((fragment) => fragment.host));
+  for (const host of allocationHosts) {
+    if (host === "home") continue;
+    if (!files.every((file) => ns.fileExists(file, host))) {
+      return {
+        ok: false,
+        reason: `${host} worker files changed during planning`,
+      };
+    }
+  }
+
+  let fresh: Observation;
+  try {
+    const server = ns.getServer(group.target);
+    const maxMoney = Number(server.moneyMax ?? 0);
+    const security = Number(server.hackDifficulty ?? 100);
+    const minSecurity = Number(server.minDifficulty ?? security);
+    fresh = {
+      valid:
+        server.hasAdminRights === true &&
+        !server.purchasedByPlayer &&
+        maxMoney > 0,
+      observedAt: plannedAt,
+      money: Number(server.moneyAvailable ?? 0),
+      maxMoney,
+      security,
+      minSecurity,
+      hackTime: 0,
+      growTime: 0,
+      weakenTime: 0,
+    };
+  } catch {
+    return {
+      ok: false,
+      reason: `${group.target} target read failed at commit`,
+    };
+  }
+
+  const targetCheck = isStillCommittable({
+    group,
+    currentGeneration,
+    fresh,
+    config,
+  });
+  if (!targetCheck.ok) {
+    return { ok: false, reason: targetCheck.reason };
   }
 
   const ordered = [...allocations].sort((a, b) => a.delay - b.delay);
@@ -369,12 +472,14 @@ export function pollReceipts(
   inFlight: InFlightLedger,
   config: SchedulerConfig,
   now: number,
+  fullSweep = true,
 ): PollResult {
   let ledger = inFlight;
   const changed: ReceiptChange[] = [];
 
   for (const receipt of inFlight.receipts) {
     if (!isLiveStatus(receipt.status)) continue;
+    if (!fullSweep && now < receipt.expectedEndAt) continue;
 
     const running = ns.isRunning(receipt.pid, receipt.runner);
     const status = classifyReceipt(receipt, {
@@ -384,7 +489,7 @@ export function pollReceipts(
     });
 
     if (status !== receipt.status) {
-      ledger = applyReceiptStatus(ledger, receipt.receiptId, status);
+      ledger = applyReceiptStatus(ledger, receipt.receiptId, status, now);
       changed.push({ receiptId: receipt.receiptId, status });
     }
   }

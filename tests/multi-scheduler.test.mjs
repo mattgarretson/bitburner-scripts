@@ -17,10 +17,14 @@ import {
 import {
   PHASE,
   batchWindowGuard,
+  canRefill,
   checkEligibility,
   classifyObservation,
+  continuationWindow,
   createTargetRecord,
   decide,
+  isStillCommittable,
+  preparedPrepPriority,
   reduceTarget,
 } from "../src/multi-scheduler.ts";
 
@@ -38,6 +42,41 @@ const CONFIG = {
 };
 
 const NOW = 1_000_000;
+
+test("refill limits enforce both the commit cap and wall-clock budget", () => {
+  assert.equal(
+    canRefill({
+      commits: 3,
+      elapsedMs: 499,
+      commitCap: 4,
+      wallClockBudgetMs: 500,
+    }),
+    true,
+  );
+  assert.equal(
+    canRefill({
+      commits: 4,
+      elapsedMs: 100,
+      commitCap: 4,
+      wallClockBudgetMs: 500,
+    }),
+    false,
+  );
+  assert.equal(
+    canRefill({
+      commits: 1,
+      elapsedMs: 500,
+      commitCap: 4,
+      wallClockBudgetMs: 500,
+    }),
+    false,
+  );
+});
+
+test("prep priority has a fallback when no prepared batch can be built", () => {
+  assert.equal(preparedPrepPriority(0, 1_000_000, 20_000), 50_000);
+  assert.equal(preparedPrepPriority(123, 1_000_000, 20_000), 123);
+});
 
 /** 4875 units per batch. */
 const SMALL_BATCH = {
@@ -171,6 +210,86 @@ test("observations classify into the three ready phases", () => {
   );
 });
 
+function committableGroup(purpose, generation = 2) {
+  return {
+    id: "group",
+    purpose,
+    target: "n00dles",
+    targetGeneration: generation,
+    plannedAt: NOW,
+    jobs: [],
+    batchCount: purpose === "batch" ? 1 : 0,
+    expectedValue: 0,
+    expectedLastEndAt: NOW,
+    continuation: false,
+  };
+}
+
+test("commit validation rejects a generation mismatch", () => {
+  const result = isStillCommittable({
+    group: committableGroup("batch"),
+    currentGeneration: 3,
+    fresh: observation(),
+    config: CONFIG,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /generation moved/);
+});
+
+test("commit validation requires the phase matching each group purpose", () => {
+  const cases = [
+    ["batch", observation({ money: 10 })],
+    ["money-prep", observation()],
+    ["security-prep", observation({ money: 10 })],
+  ];
+
+  for (const [purpose, fresh] of cases) {
+    const result = isStillCommittable({
+      group: committableGroup(purpose),
+      currentGeneration: 2,
+      fresh,
+      config: CONFIG,
+    });
+    assert.equal(result.ok, false, purpose);
+    assert.match(result.reason, /target state moved/, purpose);
+  }
+});
+
+test("commit validation uses the existing readiness tolerance boundaries", () => {
+  const atBoundary = observation({
+    money: 999_000,
+    security: 1 + CONFIG.securityTolerance,
+  });
+  const result = isStillCommittable({
+    group: committableGroup("batch"),
+    currentGeneration: 2,
+    fresh: atBoundary,
+    config: CONFIG,
+  });
+  assert.deepEqual(result, { ok: true });
+});
+
+test("commit validation accepts matching batch and prep phases", () => {
+  const cases = [
+    ["batch", observation()],
+    ["money-prep", observation({ money: 10 })],
+    ["security-prep", observation({ security: 20 })],
+  ];
+
+  for (const [purpose, fresh] of cases) {
+    assert.deepEqual(
+      isStillCommittable({
+        group: committableGroup(purpose),
+        currentGeneration: 2,
+        fresh,
+        config: CONFIG,
+      }),
+      { ok: true },
+      purpose,
+    );
+  }
+});
+
 test("a fresh observation increments the generation", () => {
   const record = createTargetRecord("n00dles");
   const next = reduceTarget(
@@ -183,6 +302,34 @@ test("a fresh observation increments the generation", () => {
   assert.equal(next.phase, PHASE.BATCH_READY);
   assert.notEqual(next, record, "reducer must not mutate");
   assert.equal(record.generation, 0);
+});
+
+test("three complete-batch shortages step sizing down and a batch commit resets it", () => {
+  let record = batchReady("n00dles", 100);
+
+  record = reduceTarget(record, { type: "batch-too-large", now: NOW }, CONFIG);
+  record = reduceTarget(record, { type: "batch-too-large", now: NOW }, CONFIG);
+  assert.equal(record.batchTooLargeCount, 2);
+  assert.equal(record.batchSizeNotches, 0);
+  assert.equal(record.phase, PHASE.BATCH_READY);
+
+  record = reduceTarget(record, { type: "batch-too-large", now: NOW }, CONFIG);
+  assert.equal(record.batchTooLargeCount, 3);
+  assert.equal(record.batchSizeNotches, 1);
+  assert.equal(record.phase, PHASE.NEEDS_OBSERVATION);
+
+  record = reduceTarget(
+    { ...record, phase: PHASE.BATCH_READY },
+    {
+      type: "group-committed",
+      groupId: "g",
+      purpose: "batch",
+      now: NOW,
+    },
+    CONFIG,
+  );
+  assert.equal(record.batchTooLargeCount, 0);
+  assert.equal(record.batchSizeNotches, 0);
 });
 
 test("a finished group settles and returns to NEEDS_OBSERVATION, never straight to ready", () => {
@@ -292,6 +439,140 @@ test("only one group is committed per decision", () => {
   assert.equal(new Set(decision.allocations.map((f) => f.target)).size, 1);
 });
 
+test("an in-flight batch chain can append a complete continuation at its window", () => {
+  const initial = planBatchGroup({
+    target: "n00dles",
+    batch: SMALL_BATCH,
+    workers: WORKERS,
+    config: CONFIG,
+    batchCount: 1,
+    groupId: "mm-chain-n00dles",
+    targetGeneration: 1,
+    plannedAt: NOW,
+  });
+  const allocation = allocateJobs(
+    createLedger(snapshots([{ host: "runner", maxRam: 1024, usedRam: 0 }])),
+    initial.jobs,
+  );
+  const inFlight = publishGroup(
+    createInFlightLedger(),
+    initial,
+    allocation.allocations,
+    allocation.allocations.map((_, index) => index + 1),
+    NOW,
+  );
+  const active = reduceTarget(
+    batchReady("n00dles", 100),
+    {
+      type: "group-committed",
+      groupId: initial.id,
+      purpose: "batch",
+      batchCount: initial.batchCount,
+      now: NOW,
+    },
+    CONFIG,
+  );
+  assert.equal(active.scheduledBatchCount, 1);
+  const window = continuationWindow(active, inFlight, CONFIG);
+  assert.ok(window);
+
+  const decision = decide({
+    targets: [active],
+    snapshots: snapshots([{ host: "runner", maxRam: 1024, usedRam: 0 }]),
+    inFlight,
+    workers: WORKERS,
+    config: CONFIG,
+    now: window.launchAt,
+    serial: 2,
+  });
+
+  assert.equal(decision.kind, "batch");
+  assert.equal(decision.group.id, initial.id);
+  assert.equal(decision.group.continuation, true);
+  assert.equal(decision.group.jobs[0].batchId, `${initial.id}-1`);
+
+  const firstHack = decision.group.jobs.find((job) => job.label === "H");
+  assert.ok(
+    decision.group.plannedAt + firstHack.delay + firstHack.duration >=
+      window.lastEndAt + CONFIG.landingGap,
+  );
+});
+
+test("a recorded terminal fault prevents batch-chain continuation", () => {
+  const initial = planBatchGroup({
+    target: "n00dles",
+    batch: SMALL_BATCH,
+    workers: WORKERS,
+    config: CONFIG,
+    batchCount: 1,
+    groupId: "mm-faulted-chain",
+    targetGeneration: 1,
+    plannedAt: NOW,
+  });
+  const allocation = allocateJobs(
+    createLedger(snapshots([{ host: "runner", maxRam: 1024, usedRam: 0 }])),
+    initial.jobs,
+  );
+  let inFlight = publishGroup(
+    createInFlightLedger(),
+    initial,
+    allocation.allocations,
+    allocation.allocations.map((_, index) => index + 1),
+    NOW,
+  );
+  inFlight = {
+    ...inFlight,
+    groupFaults: {
+      [initial.id]: {
+        lost: 1,
+        late: 0,
+        killed: 0,
+        firstFaultAt: NOW,
+      },
+    },
+  };
+  const active = reduceTarget(
+    batchReady("n00dles", 100),
+    {
+      type: "group-committed",
+      groupId: initial.id,
+      purpose: "batch",
+      batchCount: 1,
+      now: NOW,
+    },
+    CONFIG,
+  );
+
+  assert.equal(continuationWindow(active, inFlight, CONFIG), null);
+});
+
+test("a failed continuation keeps the existing chain locked and marks it dirty", () => {
+  const active = reduceTarget(
+    batchReady("n00dles", 100),
+    {
+      type: "group-committed",
+      groupId: "chain",
+      purpose: "batch",
+      batchCount: 2,
+      now: NOW,
+    },
+    CONFIG,
+  );
+  const failed = reduceTarget(
+    active,
+    {
+      type: "continuation-failed",
+      reason: "commit validation moved",
+      now: NOW + 1,
+    },
+    CONFIG,
+  );
+
+  assert.equal(failed.phase, PHASE.BATCH_IN_FLIGHT);
+  assert.equal(failed.activeGroupId, "chain");
+  assert.equal(failed.dirtyReason, "commit validation moved");
+});
+
 test("a lower-ranked complete batch is chosen when the top target cannot fit", () => {
   const decision = run(
     [
@@ -374,6 +655,32 @@ test("security prep is a single complete weaken group", () => {
   assert.equal(decision.group.jobs[0].threads, 8);
 });
 
+test("a target needing security and money receives combined grow plus weaken prep", () => {
+  const target = securityPrepReady("alpha", 100);
+  target.observation = observation({ security: 20, money: 1_000 });
+  target.economics = {
+    ...target.economics,
+    moneyPrep: MONEY_PREP,
+  };
+
+  const decision = run(
+    [target],
+    [{ host: "runner", maxRam: 1024, usedRam: 0 }],
+  );
+
+  assert.equal(decision.kind, "prep");
+  assert.equal(decision.group.purpose, "security-prep");
+  assert.deepEqual(decision.group.jobs.map((job) => job.operation).sort(), [
+    "grow",
+    "weaken",
+  ]);
+  assert.equal(
+    decision.group.jobs.find((job) => job.operation === "weaken").threads,
+    9,
+    "8 existing-security threads plus 1 grow compensator",
+  );
+});
+
 test("money prep shrinks to fit rather than failing outright", () => {
   const hungry = moneyPrepReady("huge", 50);
   hungry.economics.moneyPrep = { ...MONEY_PREP, growThreadsNeeded: 100_000 };
@@ -427,6 +734,23 @@ test("aging promotes a long-waiting prep target over a richer newcomer", () => {
 
   assert.equal(decision.kind, "prep");
   assert.equal(decision.target, "patient");
+});
+
+test("prep ordering uses fallback priority when batch economics are unavailable", () => {
+  const maxSecurity = securityPrepReady("max-security", 0);
+  maxSecurity.economics = {
+    ...maxSecurity.economics,
+    prepPriority: 500,
+  };
+  const ordinary = securityPrepReady("ordinary", 100);
+
+  const decision = run(
+    [ordinary, maxSecurity],
+    [{ host: "runner", maxRam: 1024, usedRam: 0 }],
+  );
+
+  assert.equal(decision.kind, "prep");
+  assert.equal(decision.target, "max-security");
 });
 
 test("prep is refused when it would delay a batch window that is already known", () => {
@@ -499,6 +823,7 @@ test("the batch-window guard allows prep that returns its RAM in time", () => {
         status: RECEIPT_STATUS.LAUNCHED,
       },
     ],
+    groupFaults: {},
   };
 
   const early = batchWindowGuard({

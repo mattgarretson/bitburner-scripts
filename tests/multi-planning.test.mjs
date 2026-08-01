@@ -8,6 +8,7 @@ import {
   RECEIPT_STATUS,
   allocateJobs,
   applyReceiptStatus,
+  clearGroupFault,
   classifyReceipt,
   createInFlightLedger,
   createLedger,
@@ -16,11 +17,13 @@ import {
   planLargestWave,
   planMoneyPrepGroup,
   planSecurityPrepGroup,
+  pruneTerminalReceipts,
   publishGroup,
   ramInFlightUnits,
   releaseCalendar,
   requiredUnits,
   snapshotRunners,
+  stableSizingCapacity,
   targetHasLiveReceipts,
   totalUnits,
   validateGroup,
@@ -31,6 +34,38 @@ const WORKERS = {
   grow: { file: "worker-grow.ts", ram: 1.75 },
   weaken: { file: "worker-weaken.ts", ram: 1.75 },
 };
+
+test("stable sizing capacity excludes foreign RAM but restores worker capacity", () => {
+  const capacity = stableSizingCapacity(
+    [
+      {
+        host: "home",
+        maxRam: 100,
+        foreignUsedRam: 12,
+        workersAvailable: true,
+      },
+      {
+        host: "alpha",
+        maxRam: 64,
+        foreignUsedRam: 4,
+        workersAvailable: true,
+      },
+      {
+        host: "missing-workers",
+        maxRam: 128,
+        foreignUsedRam: 0,
+        workersAvailable: false,
+      },
+    ],
+    8,
+  );
+
+  assert.equal(capacity, 140);
+  assert.ok(
+    capacity > 100 - 92 - 8,
+    "manager worker RAM remains capacity when current free RAM is exhausted",
+  );
+});
 
 const CONFIG = {
   ...DEFAULT_CONFIG,
@@ -129,6 +164,53 @@ test("allocation is deterministic for identical input", () => {
   const second = allocateJobs(ledgerOf(runners), weakenJobs(25));
 
   assert.deepEqual(first.allocations, second.allocations);
+});
+
+test("allocation retains the legacy placement sequence for a fixed workload", () => {
+  const ledger = ledgerOf([
+    { host: "beta", maxRam: 16, usedRam: 0 },
+    { host: "alpha", maxRam: 32, usedRam: 0 },
+    { host: "home", maxRam: 64, usedRam: 0 },
+  ]);
+  const jobs = weakenJobs(25);
+  const legacyEntries = ledger.entries.map((entry) => ({ ...entry }));
+  const expected = [];
+
+  for (const job of [...jobs].sort(
+    (a, b) =>
+      b.ramPerThread - a.ramPerThread ||
+      b.threads - a.threads ||
+      a.delay - b.delay ||
+      a.id.localeCompare(b.id),
+  )) {
+    let remaining = job.threads;
+    const unitCost = Math.round(job.ramPerThread * 100);
+    const hosts = [...legacyEntries].sort((a, b) => {
+      if (a.host === "home" && b.host !== "home") return 1;
+      if (b.host === "home" && a.host !== "home") return -1;
+      return b.units - a.units || a.host.localeCompare(b.host);
+    });
+
+    for (const entry of hosts) {
+      const threads = Math.min(remaining, Math.floor(entry.units / unitCost));
+      if (threads < 1) continue;
+      expected.push([job.id, entry.host, threads]);
+      entry.units -= threads * unitCost;
+      remaining -= threads;
+      if (remaining === 0) break;
+    }
+  }
+
+  const actual = allocateJobs(ledger, jobs);
+  assert.equal(actual.ok, true);
+  assert.deepEqual(
+    actual.allocations.map((fragment) => [
+      fragment.logicalJobId,
+      fragment.host,
+      fragment.threads,
+    ]),
+    expected,
+  );
 });
 
 test("a successful allocation does not mutate the input ledger", () => {
@@ -365,6 +447,41 @@ test("batches within a wave are spaced by four gaps", () => {
   assert.equal(second.delay - first.delay, 4 * CONFIG.landingGap);
 });
 
+test("continuation segments use unique batch ids and land after their chain tail", () => {
+  const initial = planBatchGroup({
+    target: "n00dles",
+    batch: BATCH,
+    workers: WORKERS,
+    config: CONFIG,
+    batchCount: 2,
+    groupId: "chain",
+    targetGeneration: 1,
+    plannedAt: 1_000,
+  });
+  const continuation = planBatchGroup({
+    target: "n00dles",
+    batch: BATCH,
+    workers: WORKERS,
+    config: CONFIG,
+    batchCount: 2,
+    groupId: "chain",
+    targetGeneration: 1,
+    plannedAt: 10_000,
+    batchIndexStart: 2,
+    continuation: true,
+  });
+
+  assert.deepEqual(
+    [...new Set(initial.jobs.map((job) => job.batchId))],
+    ["chain-0", "chain-1"],
+  );
+  assert.deepEqual(
+    [...new Set(continuation.jobs.map((job) => job.batchId))],
+    ["chain-2", "chain-3"],
+  );
+  assert.equal(continuation.continuation, true);
+});
+
 test("expectedLastEndAt is absolute when plannedAt is supplied", () => {
   const group = planBatchGroup({
     target: "n00dles",
@@ -505,6 +622,66 @@ test("a late receipt still counts as live RAM", () => {
 
   assert.equal(ramInFlightUnits(late), allocation.unitsAllocated);
   assert.equal(targetHasLiveReceipts(late, "n00dles"), true);
+  assert.equal(late.groupFaults[inFlight.receipts[0].groupId].late, 1);
+});
+
+test("group faults survive receipt pruning until explicitly cleared", () => {
+  const { inFlight } = launchedGroup();
+  const first = inFlight.receipts[0];
+  const lost = applyReceiptStatus(
+    inFlight,
+    first.receiptId,
+    RECEIPT_STATUS.LOST,
+    1234,
+  );
+  const pruned = pruneTerminalReceipts(lost);
+  const fault = pruned.groupFaults[first.groupId];
+
+  assert.equal(
+    pruned.receipts.some((receipt) => receipt.receiptId === first.receiptId),
+    false,
+  );
+  assert.deepEqual(fault, {
+    lost: 1,
+    late: 0,
+    killed: 0,
+    firstFaultAt: 1234,
+  });
+  assert.deepEqual(clearGroupFault(pruned, first.groupId).groupFaults, {});
+});
+
+test("reapplying the same receipt fault does not double count it", () => {
+  const { inFlight } = launchedGroup();
+  const first = inFlight.receipts[0];
+  const lost = applyReceiptStatus(
+    inFlight,
+    first.receiptId,
+    RECEIPT_STATUS.LOST,
+    1234,
+  );
+  const repeated = applyReceiptStatus(
+    lost,
+    first.receiptId,
+    RECEIPT_STATUS.LOST,
+    2345,
+  );
+
+  assert.equal(repeated.groupFaults[first.groupId].lost, 1);
+  assert.equal(repeated.groupFaults[first.groupId].firstFaultAt, 1234);
+});
+
+test("killed receipts are retained as group-level faults", () => {
+  const { inFlight } = launchedGroup();
+  const first = inFlight.receipts[0];
+  const killed = applyReceiptStatus(
+    inFlight,
+    first.receiptId,
+    RECEIPT_STATUS.KILLED,
+    4321,
+  );
+
+  assert.equal(killed.groupFaults[first.groupId].killed, 1);
+  assert.equal(killed.groupFaults[first.groupId].firstFaultAt, 4321);
 });
 
 test("the release calendar is ordered and answers when RAM comes back", () => {

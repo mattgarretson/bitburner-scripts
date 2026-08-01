@@ -63,6 +63,7 @@ export const DEFAULT_CONFIG = {
   lateToleranceMs: 2_000,
   earlyToleranceMs: 500,
   prepAgingMs: 60_000,
+  growSafetyMargin: 0.02,
 } as const;
 
 export type Operation = "hack" | "grow" | "weaken";
@@ -90,6 +91,7 @@ export type SchedulerConfig = {
   lateToleranceMs?: number;
   earlyToleranceMs?: number;
   prepAgingMs?: number;
+  growSafetyMargin?: number;
   launchSafetyMs?: number;
   hackFraction?: number;
   minimumHackFraction?: number;
@@ -109,6 +111,13 @@ export type RunnerSnapshot = {
   homeReserve: number;
   allocatableRam: number;
   allocatableUnits: number;
+  workersAvailable: boolean;
+};
+
+export type SizingCapacityInput = {
+  host: string;
+  maxRam: number;
+  foreignUsedRam: number;
   workersAvailable: boolean;
 };
 
@@ -147,6 +156,7 @@ export type MoneyPrepSpec = {
   weakenPerThread: number;
   growTime: number;
   weakenTime: number;
+  baseWeakenThreads?: number;
 };
 
 export type SecurityPrepSpec = {
@@ -178,6 +188,7 @@ export type JobGroup = {
   batchCount: number;
   expectedValue: number;
   expectedLastEndAt: number;
+  continuation: boolean;
 };
 
 export type Fragment = {
@@ -233,6 +244,9 @@ export type PlanBatchGroupInput = {
   groupId: string;
   targetGeneration?: number;
   plannedAt?: number;
+  batchIndexStart?: number;
+  landingOffset?: number;
+  continuation?: boolean;
 };
 
 export type PlanMoneyPrepGroupInput = {
@@ -243,6 +257,7 @@ export type PlanMoneyPrepGroupInput = {
   groupId: string;
   targetGeneration?: number;
   plannedAt?: number;
+  purpose?: "money-prep" | "security-prep";
 };
 
 export type PlanSecurityPrepGroupInput = {
@@ -324,7 +339,17 @@ export type Receipt = {
   status: ReceiptStatus;
 };
 
-export type InFlightLedger = { receipts: Receipt[] };
+export type GroupFault = {
+  lost: number;
+  late: number;
+  killed: number;
+  firstFaultAt: number;
+};
+
+export type InFlightLedger = {
+  receipts: Receipt[];
+  groupFaults: Record<string, GroupFault>;
+};
 export type ReleaseEvent = { at: number; units: number };
 
 // -----------------------------------------------------------------------------
@@ -370,6 +395,20 @@ export function snapshotRunners(
       workersAvailable: runner.workersAvailable !== false,
     };
   });
+}
+
+export function stableSizingCapacity(
+  runners: SizingCapacityInput[],
+  homeReserve: number,
+): number {
+  return runners.reduce((sum, runner) => {
+    if (!runner.workersAvailable) return sum;
+    const reserve = runner.host === "home" ? Math.max(0, homeReserve) : 0;
+    return (
+      sum +
+      Math.max(0, runner.maxRam - reserve - Math.max(0, runner.foreignUsedRam))
+    );
+  }, 0);
 }
 
 /**
@@ -443,6 +482,7 @@ function makeGroup(input: MakeGroupInput): JobGroup {
     batchCount: input.batchCount,
     expectedValue: input.expectedValue,
     expectedLastEndAt: input.plannedAt + lastEnd,
+    continuation: input.continuation,
   };
 }
 
@@ -453,10 +493,13 @@ function makeGroup(input: MakeGroupInput): JobGroup {
 export function planBatchGroup(input: PlanBatchGroupInput): JobGroup {
   const { target, batch, workers, config, batchCount, groupId } = input;
   const spacing = 4 * config.landingGap;
+  const batchIndexStart = Math.max(0, Math.floor(input.batchIndexStart ?? 0));
+  const landingOffset = Math.max(0, input.landingOffset ?? 0);
   const jobs: LogicalJob[] = [];
 
-  for (let index = 0; index < batchCount; index++) {
-    const offset = index * spacing;
+  for (let localIndex = 0; localIndex < batchCount; localIndex++) {
+    const index = batchIndexStart + localIndex;
+    const offset = landingOffset + localIndex * spacing;
     const batchId = `${groupId}-${index}`;
 
     jobs.push(
@@ -523,6 +566,7 @@ export function planBatchGroup(input: PlanBatchGroupInput): JobGroup {
     jobs,
     batchCount,
     expectedValue: batch.expectedMoney * batchCount,
+    continuation: input.continuation ?? false,
   });
 }
 
@@ -561,13 +605,14 @@ export function planMoneyPrepGroup(input: PlanMoneyPrepGroupInput): JobGroup {
 
   return makeGroup({
     id: groupId,
-    purpose: "money-prep",
+    purpose: input.purpose ?? "money-prep",
     target,
     targetGeneration: input.targetGeneration ?? 0,
     plannedAt: input.plannedAt ?? 0,
     jobs,
     batchCount: 0,
     expectedValue: 0,
+    continuation: false,
   });
 }
 
@@ -600,6 +645,7 @@ export function planSecurityPrepGroup(
     jobs,
     batchCount: 0,
     expectedValue: 0,
+    continuation: false,
   });
 }
 
@@ -683,6 +729,25 @@ function compareHostsForPlacement(a: LedgerEntry, b: LedgerEntry): number {
   return b.units - a.units || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0);
 }
 
+function insertHostForPlacement(
+  ordered: LedgerEntry[],
+  entry: LedgerEntry,
+): void {
+  let low = 0;
+  let high = ordered.length;
+
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (compareHostsForPlacement(ordered[middle], entry) <= 0) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  ordered.splice(low, 0, entry);
+}
+
 /**
  * Allocate every thread of every job against a private copy of the ledger.
  *
@@ -723,19 +788,21 @@ export function allocateJobs(
   }
 
   const ordered = [...jobs].sort(compareJobsForAllocation);
+  const hosts = [...working].sort(compareHostsForPlacement);
 
   for (const job of ordered) {
     const unitCost = toUnits(job.ramPerThread);
     let remaining = job.threads;
 
-    const hosts = [...working].sort(compareHostsForPlacement);
-
-    for (const entry of hosts) {
-      if (remaining <= 0) break;
-
+    let hostIndex = 0;
+    while (remaining > 0 && hostIndex < hosts.length) {
+      const entry = hosts[hostIndex];
       const capacity = Math.floor(entry.units / unitCost);
       const threads = Math.min(remaining, capacity);
-      if (threads < 1) continue;
+      if (threads < 1) {
+        hostIndex++;
+        continue;
+      }
 
       allocations.push({
         groupId: job.groupId,
@@ -757,6 +824,10 @@ export function allocateJobs(
       entry.units -= threads * unitCost;
       unitsAllocated += threads * unitCost;
       remaining -= threads;
+
+      hosts.splice(hostIndex, 1);
+      insertHostForPlacement(hosts, entry);
+      hostIndex = 0;
     }
 
     if (remaining > 0) {
@@ -896,9 +967,9 @@ export function weakenThreadsForGrowThreads(
   spec: MoneyPrepSpec,
 ): number {
   const security = growThreads * spec.growSecurityPerThread;
-  return Math.max(
-    1,
-    Math.ceil(security / Math.max(1e-9, spec.weakenPerThread)),
+  return (
+    Math.max(0, Math.floor(spec.baseWeakenThreads ?? 0)) +
+    Math.max(1, Math.ceil(security / Math.max(1e-9, spec.weakenPerThread)))
   );
 }
 
@@ -914,10 +985,8 @@ export function planLargestMoneyPrep(
   const needed = Math.max(1, Math.floor(input.prep.growThreadsNeeded));
   let low = 1;
   let high = needed;
-  let best: Omit<
-    Extract<MoneyPrepPlanResult, { ok: true }>,
-    "ok"
-  > | null = null;
+  let best: Omit<Extract<MoneyPrepPlanResult, { ok: true }>, "ok"> | null =
+    null;
 
   while (low <= high) {
     const growThreads = Math.floor((low + high) / 2);
@@ -981,10 +1050,8 @@ export function planLargestSecurityPrep(
   const needed = Math.max(1, Math.floor(input.prep.threadsNeeded));
   let low = 1;
   let high = needed;
-  let best: Omit<
-    Extract<SecurityPrepPlanResult, { ok: true }>,
-    "ok"
-  > | null = null;
+  let best: Omit<Extract<SecurityPrepPlanResult, { ok: true }>, "ok"> | null =
+    null;
 
   while (low <= high) {
     const threads = Math.floor((low + high) / 2);
@@ -1033,7 +1100,7 @@ export function planLargestSecurityPrep(
 // -----------------------------------------------------------------------------
 
 export function createInFlightLedger(): InFlightLedger {
-  return { receipts: [] };
+  return { receipts: [], groupFaults: {} };
 }
 
 /** Receipts are published only after a whole group launches. */
@@ -1060,7 +1127,10 @@ export function publishGroup(
     status: RECEIPT_STATUS.LAUNCHED,
   }));
 
-  return { receipts: [...ledger.receipts, ...receipts] };
+  return {
+    receipts: [...ledger.receipts, ...receipts],
+    groupFaults: ledger.groupFaults,
+  };
 }
 
 export function isLiveStatus(status: ReceiptStatus): boolean {
@@ -1118,18 +1188,68 @@ export function applyReceiptStatus(
   ledger: InFlightLedger,
   receiptId: string,
   status: ReceiptStatus,
+  faultAt?: number,
 ): InFlightLedger {
+  const previous = ledger.receipts.find(
+    (receipt) => receipt.receiptId === receiptId,
+  );
+  let groupFaults = ledger.groupFaults;
+
+  if (
+    previous &&
+    previous.status !== status &&
+    (status === RECEIPT_STATUS.LOST ||
+      status === RECEIPT_STATUS.LATE ||
+      status === RECEIPT_STATUS.KILLED)
+  ) {
+    const existing = groupFaults[previous.groupId] ?? {
+      lost: 0,
+      late: 0,
+      killed: 0,
+      firstFaultAt: faultAt ?? previous.expectedEndAt,
+    };
+    const key =
+      status === RECEIPT_STATUS.LOST
+        ? "lost"
+        : status === RECEIPT_STATUS.LATE
+          ? "late"
+          : "killed";
+    groupFaults = {
+      ...groupFaults,
+      [previous.groupId]: {
+        ...existing,
+        [key]: existing[key] + 1,
+        firstFaultAt: Math.min(
+          existing.firstFaultAt,
+          faultAt ?? previous.expectedEndAt,
+        ),
+      },
+    };
+  }
+
   return {
     receipts: ledger.receipts.map((receipt) =>
       receipt.receiptId === receiptId ? { ...receipt, status } : receipt,
     ),
+    groupFaults,
   };
 }
 
 export function pruneTerminalReceipts(ledger: InFlightLedger): InFlightLedger {
   return {
     receipts: ledger.receipts.filter((receipt) => isLiveStatus(receipt.status)),
+    groupFaults: ledger.groupFaults,
   };
+}
+
+export function clearGroupFault(
+  ledger: InFlightLedger,
+  groupId: string,
+): InFlightLedger {
+  if (!(groupId in ledger.groupFaults)) return ledger;
+  const groupFaults = { ...ledger.groupFaults };
+  delete groupFaults[groupId];
+  return { receipts: ledger.receipts, groupFaults };
 }
 
 /** When each live receipt is expected to give its RAM back, ascending. */
