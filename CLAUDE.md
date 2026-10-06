@@ -27,9 +27,9 @@ Single test file: `node --test tests/<name>.test.mjs`. Single test by name:
 `node --test --test-name-pattern "<regex>"`.
 
 **Both `npm test` and `npm run check` are green and must stay that way.** As of the last
-sweep: 67 tests passing across `tests/multi-planning.test.mjs`,
-`tests/multi-scheduler.test.mjs`, and `tests/multi-runtime.test.mjs`, and zero `tsc`
-errors under `"strict": true`.
+sweep: 95 tests passing across `tests/hacking-lib.test.mjs`,
+`tests/multi-planning.test.mjs`, `tests/multi-scheduler.test.mjs`, and
+`tests/multi-runtime.test.mjs`, and zero `tsc` errors under `"strict": true`.
 
 Tests are plain `.mjs` importing the `.ts` sources directly — Node's type-stripping runs
 them without a build step, which is why the pure modules must stay free of any `ns` import.
@@ -56,17 +56,56 @@ them without a build step, which is why the pure modules must stay free of any `
 - Bitburner 3.x moved purchased-server APIs under `ns.cloud.*` and formatting under
   `ns.format.*`. Older Netscript snippets found online will use the pre-3.x names.
 
+## Code style
+
+Write for a person reading the file top to bottom. Prettier owns layout
+(`npm run format`); these rules are about structure. `src/singularity/workout.ts` is the
+reference example of a small script written this way.
+
+- **`main` reads like a description of the script.** Keep it to the high-level steps and
+  move each step into a small named function declared below it. Nested loops, inline state
+  checks, or a tracking flag in `main` usually mean a helper is missing.
+- **Names say what the thing means.** `CONSTANT_CASE` module constants, `UpperCamelCase`
+  types, `lowerCamelCase` functions. Predicates read as questions (`isWorkingOut`), actions
+  as verbs (`startWorkout`).
+- **Named functions are function declarations**, not arrow-function constants, with
+  explicit parameter and return types.
+- **Guard clauses over nesting:** `if (done) continue;` or an early `return` first, then
+  the main path unindented.
+- **Comments:** a short `/** JSDoc */` on a helper saying what it does; `//` only for *why*
+  a line exists (a game quirk, a non-obvious ordering). Don't narrate what the code already
+  says. Every script keeps the header block used across `src/`: `path — one-line summary`,
+  behaviour notes, `Usage: run ...`, `@param {NS} ns`.
+- **New scripts take their tunables as constants at the top of the file**, not as flags or
+  arguments.
+- **Lookup tables are `as const` arrays or objects**, with types derived from them
+  (`type Stat = (typeof STATS)[number]`) rather than a hand-written union kept in sync.
+  Plain string literals are fine for game names — `tsc` checks them against the generated
+  definitions.
+- **Failures in runnable scripts go to the terminal, not exceptions.** Print the problem
+  with `ns.tprint` and end the script; do not `throw` for an expected failure. When the
+  failure is detected below `main`, use a small `fail(ns, message): never` helper
+  (`ns.tprint` then `ns.exit()`, which costs 0 GB) instead of passing `false` back up
+  through every caller. Pure modules are different: they return structured results
+  (`ok: false` plus a reason), as described under Plan-then-launch.
+
 ## Architecture
 
-### Orchestration / calculation split
+### Module split
 
-`manager.ts` is the single-target HGW manager and is deliberately kept as a readable event
-loop: refresh infrastructure → pick target → weaken to min security → grow to max money →
-launch the largest complete batch wave that fits. It contains no allocation math.
+`multi-manager.ts` is the multi-target HGW scheduler and the only hacking manager. It is
+kept as a readable event loop: refresh infrastructure → reconcile receipts → observe
+quiescent targets → snapshot runners → ask for one decision → commit it → render → sleep.
+It contains no allocation math. The work is split across:
 
-`hacking-lib.ts` holds everything else: network scan/root/deploy, runner discovery,
-target inspection and ranking, batch sizing, RAM allocation, and atomic launch. Keep this
-boundary — calculations go in the library, sequencing goes in the manager.
+- `multi-runtime.ts` — every `ns` read, exec, kill and PID poll for the scheduler.
+- `multi-planning.ts` — pure job timing, RAM allocation, and in-flight receipt accounting.
+- `multi-scheduler.ts` — pure per-target reducer and the `decide()` policy.
+- `hacking-lib.ts` — shared `ns` helpers: network scan/root/deploy, worker costs, target
+  inspection, and the prepared-batch model (`buildPreparedBatch`, `rankTargets`).
+
+Keep the purity boundary: `multi-planning.ts` and `multi-scheduler.ts` must contain no `ns`
+access, which is what lets the Node tests import them directly.
 
 ### The worker contract
 
@@ -78,23 +117,24 @@ All three workers take the same positional args and perform exactly one operatio
 
 Each worker subtracts launch skew (`Date.now() - plannedAt`) from `requestedDelay` and
 passes the remainder as `additionalMsec`, so a slow `ns.exec` sequence doesn't smear the
-H/W/G/W landing order. Args 3 and 4 are informational today — they exist so a scheduler
-can tag and later recover its own processes without changing worker behavior.
+H/W/G/W landing order. Arg 3 carries the scheduler's `mm-` group tag, which is how
+`recoverTaggedProcesses()` finds its own workers after a restart.
 
 ### Plan-then-launch
 
-Nothing is executed until a whole logical unit is allocated. `allocateJobs()` allocates
-against a **private RAM ledger** copied from live free RAM, so a non-null return means
-every thread of every job has a home; `null` means at least one didn't fit and nothing was
-touched. `launchAtomic()` then execs in delay order and kills every already-launched PID if
-any `ns.exec` returns 0. Wave and prep sizing (`planLargestWave`, `planMoneyPrep`) binary-search
-the largest size that allocates.
+Nothing is executed until a whole logical unit is allocated. `allocateJobs()` in
+`multi-planning.ts` allocates against a **private copy of the RAM ledger**, so `ok: true`
+means every thread of every job has a home; `ok: false` carries a structured rejection and
+nothing was touched. `commitGroup()` in `multi-runtime.ts` re-checks live RAM and target
+state, execs in delay order, and kills every already-launched PID if any `ns.exec` returns
+0. Wave and prep sizing (`planLargestWave`, `planLargestMoneyPrep`,
+`planLargestSecurityPrep`) binary-search the largest size that allocates.
 
 A wave is only ever shrunk by whole batches. A batch is H + W1 + G + W2; never drop an
 operation or a compensating weaken to make something fit. Money prep is always grow plus
 its weaken.
 
-`config.homeReserve` is subtracted from `home`'s free RAM in `freeRam()` before any
+`config.homeReserve` is subtracted from `home`'s RAM in `snapshotRunners()` before any
 planning, so it must not be circumvented anywhere.
 
 ### Batch model details worth knowing before editing `hacking-lib.ts`
@@ -106,24 +146,19 @@ planning, so it must not be circumvented anywhere.
 - `weakenThreadsForGrow()` deliberately omits the hostname argument to
   `ns.growthAnalyzeSecurity` — passing it caps the result against the target's *current*
   money, which is wrong when planning growth that happens after a future hack.
-- `rankTargets()` scores expected dollars/second under the manager's real four-operation
-  batch, priced against currently free RAM — not a generic max-money/weaken-time heuristic.
-  `scout.ts` and `manager.ts --report` render the same model.
+- `rankTargets()` scores expected dollars/second under a real four-operation batch, priced
+  against the given RAM — not a generic max-money/weaken-time heuristic.
 
-## In-progress work: the multi-target scheduler
+## Scheduler rules
 
-`docs/multi-target-design.md` is the accepted design for a multi-target scheduler and is
-the spec to follow for that work. `docs/scheduler-improvement-plan.md` is the current
-ordered work list against that scheduler — dependency-ordered, so do its items in order.
+`docs/multi-target-design.md` is the accepted design for the scheduler.
+`docs/scheduler-improvement-plan.md` is the ordered work list against it —
+dependency-ordered, so do its items in order. Both predate the removal of the old
+single-target `manager.ts`; ignore their references to it.
 
-Load-bearing rules from the design doc and from `AGENTS.md`:
-
-- **Do not modify `manager.ts` or the workers** while building it — `manager.ts` stays as
-  the stable single-target fallback. New code goes in `multi-manager.ts` (loop + status),
-  `multi-runtime.ts` (all `ns` reads/exec/kill), `multi-planning.ts` (pure allocation and
-  timing), `multi-scheduler.ts` (pure target reducer/policy).
-- `multi-manager.ts` must detect a running `manager.ts` or a second `multi-manager.ts`,
-  report `CONFLICTING_MANAGER`, and launch nothing. It must never kill the fallback.
+- **Do not modify the workers** — see the RAM-cost note above.
+- `multi-manager.ts` must detect a second running copy of itself, report
+  `CONFLICTING_MANAGER`, and launch nothing. It must never kill the other copy.
 - Never schedule from predicted state. A target returns to `NEEDS_OBSERVATION` after any
   group ends; generation tokens invalidate plans built from a stale observation.
 - Complete profitable batches are considered before prep; prep may only use RAM the batch
@@ -135,10 +170,15 @@ Load-bearing rules from the design doc and from `AGENTS.md`:
 
 ## Other scripts
 
-`scout.ts` (target report), `cloud-manager.ts` (buys/upgrades `ns.cloud` servers by lowest
-$/GB), `hacknet-roi.ts` (buys the shortest-payback Hacknet upgrade; refuses BN9 hash mode),
-`path.ts` (connect path to a host), `find-contracts.ts`, `stop-hacking.ts` (kills the
-manager and all workers network-wide — run before replacing the suite).
+`cloud-manager.ts` (buys/upgrades `ns.cloud` servers by lowest
+$/GB until all are at the ceiling, then exits),
+`xp-farm.ts` / `xp-grow.ts` (grow loop for hacking XP), `path.ts`
+(connect path to a host), `stop-hacking.ts` (kills the manager and all
+workers network-wide — run before replacing the suite).
+
+`src/singularity/` holds Singularity-API scripts (`buy-programs.ts`, `backdoor.ts`);
+they import shared code as `../hacking-lib.ts`, so any script name they pass to
+Netscript must include the folder.
 
 `src/README.txt` is the in-game user-facing quick reference and ships to `home` with the
 scripts; keep it in sync when flags or usage change.

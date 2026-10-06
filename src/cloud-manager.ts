@@ -1,122 +1,189 @@
 /**
- * cloud-manager.ts — buys and upgrades cloud servers in Bitburner 3.x
+ * cloud-manager.ts — buys and upgrades cloud servers until every slot is at the
+ * RAM limit, then exits
  *
- * Version 3 moved purchased-server APIs under ns.cloud.
- * Chooses the available purchase/upgrade with the lowest dollars per added GB.
+ * Each step considers buying a new server and upgrading each existing one, each
+ * sized to the largest power of two the budget allows, and takes the option with
+ * the lowest cost per added GB. Where price is proportional to RAM (most
+ * BitNodes) those tie, and the one adding the most RAM wins.
  *
- * Usage:
- *   run cloud-manager.ts
- *   run cloud-manager.ts 0.20 5000000 8 1048576 pserv
- *
- * Args:
- *   0: max fraction of cash for one purchase  default 0.20
- *   1: absolute cash reserve                 default $5m
- *   2: minimum new-server RAM                default 8 GB
- *   3: desired RAM ceiling                   default API maximum
- *   4: hostname prefix                       default pserv
- *
- * @param {NS} ns
+ * Usage: run cloud-manager.ts
  */
-type CloudCandidate = {
+
+/** Share of current cash one step may spend. */
+const SPEND_FRACTION = 0.2;
+/** Cash that is never spent. */
+const CASH_RESERVE = 5_000_000;
+/** Smallest server worth buying, in GB. */
+const MIN_RAM = 8;
+const NAME_PREFIX = "pserv";
+
+type Step = {
   label: string;
   cost: number;
   addedRam: number;
-  act: () => string | boolean;
+  act: () => boolean;
 };
 
 export async function main(ns: NS): Promise<void> {
   ns.disableLog("ALL");
 
-  const purchaseFraction = clamp(Number(ns.args[0] ?? 0.2), 0, 1);
-  const cashReserve = Math.max(0, Number(ns.args[1] ?? 5_000_000));
-  const minRam = floorPowerOfTwo(Math.max(2, Number(ns.args[2] ?? 8)));
-  const ramCeiling = Math.min(
-    ns.cloud.getRamLimit(),
-    floorPowerOfTwo(
-      Math.max(minRam, Number(ns.args[3] ?? ns.cloud.getRamLimit())),
-    ),
-  );
-  const prefix = String(ns.args[4] ?? "pserv");
+  const ceiling = ns.cloud.getRamLimit();
+  let lastWaiting = "";
 
   while (true) {
     const servers = ns.cloud.getServerNames();
-    const candidates: CloudCandidate[] = [];
+    const slotsLeft = ns.cloud.getServerLimit() - servers.length;
 
-    if (servers.length < ns.cloud.getServerLimit()) {
-      const cost = ns.cloud.getServerCost(minRam);
-      candidates.push({
-        label: `buy ${minRam}GB server`,
-        cost,
-        addedRam: minRam,
-        act: () => ns.cloud.purchaseServer(nextName(servers, prefix), minRam),
-      });
-    }
-
-    for (const host of servers) {
-      const current = ns.getServerMaxRam(host);
-      if (current >= ramCeiling) continue;
-      const next = Math.min(ramCeiling, current * 2);
-      const cost = ns.cloud.getServerUpgradeCost(host, next);
-      candidates.push({
-        label: `upgrade ${host}: ${current} -> ${next}GB`,
-        cost,
-        addedRam: next - current,
-        act: () => ns.cloud.upgradeServer(host, next),
-      });
-    }
-
-    const best = candidates
-      .filter((c) => Number.isFinite(c.cost) && c.cost > 0 && c.addedRam > 0)
-      .map((c) => ({ ...c, costPerGb: c.cost / c.addedRam }))
-      .sort((a, b) => a.costPerGb - b.costPerGb || a.cost - b.cost)[0];
-
-    if (!best) {
-      await ns.sleep(10_000);
-      continue;
+    if (
+      slotsLeft <= 0 &&
+      servers.every((host) => ns.getServerMaxRam(host) >= ceiling)
+    ) {
+      ns.tprint(
+        `cloud-manager: all ${servers.length} servers are at ` +
+          `${ns.format.ram(ceiling)}. Nothing left to buy.`,
+      );
+      return;
     }
 
     const cash = ns.getServerMoneyAvailable("home");
-    const spendable = Math.max(
+    const budget = Math.max(
       0,
-      Math.min(cash * purchaseFraction, cash - cashReserve),
+      Math.min(cash * SPEND_FRACTION, cash - CASH_RESERVE),
     );
 
-    if (best.cost <= spendable) {
-      const result = best.act();
-      if (result !== false && result !== "") {
-        ns.print(
-          `${best.label} | ${ns.format.number(best.cost)} | ${ns.format.number(best.costPerGb)}/GB`,
-        );
+    const step = bestStep(ns, ceiling, servers, slotsLeft, budget);
+
+    if (!step) {
+      const waiting = describeNextStep(ns, ceiling, servers, slotsLeft);
+      if (waiting !== lastWaiting) {
+        ns.print(`waiting: ${waiting} | budget $${ns.format.number(budget)}`);
+        lastWaiting = waiting;
       }
-      await ns.sleep(500);
+      await ns.sleep(5_000);
+      continue;
+    }
+
+    lastWaiting = "";
+    if (step.act()) {
+      ns.print(
+        `${step.label} | $${ns.format.number(step.cost)} | ` +
+          `$${ns.format.number(step.cost / step.addedRam)}/GB`,
+      );
+      await ns.sleep(100);
     } else {
-      await ns.sleep(5000);
+      ns.print(`FAILED: ${step.label} | $${ns.format.number(step.cost)}`);
+      await ns.sleep(5_000);
     }
   }
 }
 
 /**
- * @param {string[]} existing
- * @param {string} prefix
+ * The affordable step with the lowest cost per added GB; ties go to the step
+ * adding the most RAM, so linear pricing makes the largest jump.
  */
-function nextName(existing: string[], prefix: string): string {
+function bestStep(
+  ns: NS,
+  ceiling: number,
+  servers: string[],
+  slotsLeft: number,
+  budget: number,
+): Step | null {
+  const steps: Step[] = [];
+
+  if (slotsLeft > 0) {
+    const buy = largestAffordable(MIN_RAM, ceiling, budget, (ram) =>
+      ns.cloud.getServerCost(ram),
+    );
+    if (buy) {
+      const name = nextName(servers);
+      steps.push({
+        label: `buy ${name} at ${ns.format.ram(buy.ram)}`,
+        cost: buy.cost,
+        addedRam: buy.ram,
+        act: () => ns.cloud.purchaseServer(name, buy.ram) !== "",
+      });
+    }
+  }
+
+  for (const host of servers) {
+    const current = ns.getServerMaxRam(host);
+    if (current >= ceiling) continue;
+
+    const upgrade = largestAffordable(current * 2, ceiling, budget, (ram) =>
+      ns.cloud.getServerUpgradeCost(host, ram),
+    );
+    if (upgrade) {
+      steps.push({
+        label: `upgrade ${host}: ${ns.format.ram(current)} -> ${ns.format.ram(upgrade.ram)}`,
+        cost: upgrade.cost,
+        addedRam: upgrade.ram - current,
+        act: () => ns.cloud.upgradeServer(host, upgrade.ram),
+      });
+    }
+  }
+
+  steps.sort((a, b) => {
+    const perGb = a.cost / a.addedRam - b.cost / b.addedRam;
+    const tied = Math.abs(perGb) <= 1e-9 * Math.max(a.cost, b.cost);
+    return tied ? b.addedRam - a.addedRam : perGb;
+  });
+  return steps[0] ?? null;
+}
+
+/** Largest power-of-two RAM in [lowest, highest] whose cost fits the budget. */
+function largestAffordable(
+  lowest: number,
+  highest: number,
+  budget: number,
+  costOf: (ram: number) => number,
+): { ram: number; cost: number } | null {
+  for (let ram = highest; ram >= lowest; ram /= 2) {
+    const cost = costOf(ram);
+    if (Number.isFinite(cost) && cost > 0 && cost <= budget) {
+      return { ram, cost };
+    }
+  }
+  return null;
+}
+
+/** The cheapest possible next step, for the waiting message. */
+function describeNextStep(
+  ns: NS,
+  ceiling: number,
+  servers: string[],
+  slotsLeft: number,
+): string {
+  const options: { label: string; cost: number }[] = [];
+
+  if (slotsLeft > 0) {
+    options.push({
+      label: `new ${ns.format.ram(MIN_RAM)} server`,
+      cost: ns.cloud.getServerCost(MIN_RAM),
+    });
+  }
+  for (const host of servers) {
+    const current = ns.getServerMaxRam(host);
+    if (current >= ceiling) continue;
+    options.push({
+      label: `${host} ${ns.format.ram(current)} -> ${ns.format.ram(current * 2)}`,
+      cost: ns.cloud.getServerUpgradeCost(host, current * 2),
+    });
+  }
+
+  const cheapest = options
+    .filter((option) => Number.isFinite(option.cost) && option.cost > 0)
+    .sort((a, b) => a.cost - b.cost)[0];
+
+  return cheapest
+    ? `${cheapest.label} costs $${ns.format.number(cheapest.cost)}`
+    : "no valid step";
+}
+
+function nextName(existing: string[]): string {
   const used = new Set(existing);
   for (let i = 0; ; i++) {
-    const name = `${prefix}-${String(i).padStart(2, "0")}`;
+    const name = `${NAME_PREFIX}-${String(i).padStart(2, "0")}`;
     if (!used.has(name)) return name;
   }
-}
-
-/** @param {number} value */
-function floorPowerOfTwo(value: number): number {
-  return Math.pow(2, Math.floor(Math.log2(Math.max(1, value))));
-}
-
-/**
- * @param {number} value
- * @param {number} min
- * @param {number} max
- */
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
 }

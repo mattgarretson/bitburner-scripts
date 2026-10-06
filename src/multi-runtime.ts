@@ -82,8 +82,7 @@ export type PollResult = {
 };
 
 /**
- * Refuse to run alongside the single-target fallback or a second copy of
- * ourselves. Never kills either one.
+ * Refuse to run alongside a second copy of ourselves. Never kills it.
  *
  * @param {NS} ns
  * @returns {string|null}
@@ -92,9 +91,6 @@ export function detectConflictingManager(ns: NS): string | null {
   const self = ns.getScriptName();
 
   for (const process of ns.ps("home")) {
-    if (process.filename === "manager.ts") {
-      return `manager.ts is running on home (pid ${process.pid})`;
-    }
     if (process.filename === self && process.pid !== ns.pid) {
       return `${self} is already running (pid ${process.pid})`;
     }
@@ -339,6 +335,7 @@ export function computeEconomics(
  * @param {JobGroup} group
  * @param {Fragment[]} allocations
  * @param {SchedulerConfig} config
+ * @param {number} [currentGeneration]
  * @returns {{ok: true, pids: number[], plannedAt: number, allocations: Fragment[]}|{ok: false, reason: string, rolledBack?: number}}
  */
 export function commitGroup(
@@ -346,7 +343,7 @@ export function commitGroup(
   group: JobGroup,
   allocations: Fragment[],
   config: SchedulerConfig,
-  currentGeneration: number,
+  currentGeneration: number = group.targetGeneration,
 ): CommitResult {
   const plannedAt = Date.now();
   const skew = plannedAt - group.plannedAt;

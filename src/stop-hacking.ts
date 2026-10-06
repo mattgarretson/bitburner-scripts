@@ -7,7 +7,6 @@
 export async function main(ns: NS): Promise<void> {
   const scripts = [
     "early-hack.ts",
-    "manager.ts",
     "multi-manager.ts",
     "worker-hack.ts",
     "worker-grow.ts",

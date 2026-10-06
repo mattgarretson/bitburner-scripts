@@ -287,6 +287,19 @@ test("a commit is refused when the target generation changed", () => {
   assert.equal(execCalls, 0);
 });
 
+test("a mixed-version caller may omit the live generation", () => {
+  const { group, allocations } = plannedGroup();
+  let execCalls = 0;
+  const ns = fakeNs({
+    exec: () => ++execCalls,
+  });
+
+  const result = commitGroup(ns, group, allocations, CONFIG);
+
+  assert.equal(result.ok, true);
+  assert.equal(execCalls, allocations.length);
+});
+
 test("a commit is refused when target readiness changed", () => {
   const { group, allocations } = plannedGroup();
   const ns = fakeNs({
@@ -476,15 +489,6 @@ test("recovery finds only workers this manager tagged", () => {
     found.map((entry) => entry.target),
     ["n00dles", "n00dles"],
   );
-});
-
-test("the fallback manager is detected and never killed", () => {
-  const ns = fakeNs({
-    ps: () => [{ filename: "manager.ts", pid: 9, args: [] }],
-  });
-  const conflict = detectConflictingManager(ns);
-
-  assert.match(conflict, /manager\.ts/);
 });
 
 test("a second copy of this manager is detected", () => {

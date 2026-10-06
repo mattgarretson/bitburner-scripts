@@ -487,8 +487,8 @@ function makeGroup(input: MakeGroupInput): JobGroup {
 }
 
 /**
- * Build a complete H/W1/G/W2 wave. Landing order is enforced by delay maths
- * identical to the accepted single-target model in manager.ts.
+ * Build a complete H/W1/G/W2 wave. Landing order is enforced by delay maths:
+ * each operation lands one landing gap after the previous one.
  */
 export function planBatchGroup(input: PlanBatchGroupInput): JobGroup {
   const { target, batch, workers, config, batchCount, groupId } = input;

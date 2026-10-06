@@ -8,9 +8,6 @@
  *   refresh infrastructure -> reconcile receipts -> observe quiescent targets
  *   -> snapshot runners -> ask for one decision -> commit it -> render -> sleep
  *
- * manager.ts remains the single-target fallback and is never modified or killed
- * by this script.
- *
  * Start:
  *   run multi-manager.ts --hack 0.10 --reserve 8 --targets 8
  *
@@ -948,7 +945,6 @@ Options:
   --report    print a report and exit
   --help      show this text
 
-manager.ts stays the single-target fallback. This script refuses to start while
-manager.ts is running, and never kills it.
+Refuses to start while another copy is running, and never kills it.
 `);
 }
