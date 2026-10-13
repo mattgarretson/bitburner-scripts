@@ -25,12 +25,33 @@ MULTI-MANAGER OPTIONS
   --help           full option list
 
 OTHER UTILITIES
-  run cloud-manager.ts               buy/upgrade cloud servers until maxed
+  run cloud-manager.ts [--yolo]      buy/upgrade cloud servers evenly until maxed (--yolo: spend every dollar, no cap or reserve)
+  run cloud-sizes.ts                 list every cloud server's RAM, plus the total
+  run network-ram.ts                 used/free RAM on every rooted server that is not home or cloud, plus RAM still behind unopened ports
   run xp-farm.ts joesguns [home GB to keep] [--cloud [--keep N]]   grow loop for hacking XP (--keep: cloud servers left free, default 1)
+  run xp-farm.ts joesguns --host pserv-03                          same loop on that one server only; home is left alone
   run path.ts CSEC
   run stop-hacking.ts
+
+GANG (needs a gang)
+  run gang/set-activity.ts Territory Warfare    puts every member on that task; exact name, leave it out to list them
+  One-word shortcuts, typed once in the Terminal (they are kept in the save, not on home):
+    alias gjustice="run gang/set-activity.ts Vigilante Justice"
+    alias gmug="run gang/set-activity.ts Mug People"
+    alias gtraffick="run gang/set-activity.ts Human Trafficking"
+    alias gcombat="run gang/set-activity.ts Train Combat"
+    alias ghack="run gang/set-activity.ts Train Hacking"
+    alias gwar="run gang/set-activity.ts Territory Warfare"
 
 SINGULARITY (needs BitNode 4 or Source-File 4)
   run singularity/buy-programs.ts    buys TOR + every darkweb program, cheapest first
   run singularity/backdoor.ts        backdoors every server you can, faction servers first
-  run singularity/workout.ts         trains str/def/dex/agi to 200 at Powerhouse Gym, then exits
+  run singularity/workout.ts [level] trains str/def/dex/agi to that level (default 200) at Powerhouse Gym, then exits
+  run singularity/buy-augs.ts        buys every augmentation you can, priciest first, then NeuroFlux levels (~418 GB at SF4 level 1)
+
+SINGULARITY, ONE CALL EACH (cheap on RAM; each earns Intelligence exp the UI button does not)
+  run singularity/buy-aug.ts NeuroFlux Governor   buys just that augmentation, exact name (~82 GB at SF4 level 1)
+  run singularity/install-augs.ts                 asks, then installs your augmentations and resets (~82 GB)
+  run singularity/upgrade-home-ram.ts             buys every home RAM upgrade you can afford (~50 GB)
+  run singularity/upgrade-home-cores.ts           buys every home core you can afford (~50 GB)
+  run singularity/join-factions.ts                accepts every waiting invitation except city factions (~50 GB)
