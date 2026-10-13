@@ -2,19 +2,28 @@
  * cloud-manager.ts — buys and upgrades cloud servers until every slot is at the
  * RAM limit, then exits
  *
- * Each step considers buying a new server and upgrading each existing one, each
- * sized to the largest power of two the budget allows, and takes the option with
- * the lowest cost per added GB. Where price is proportional to RAM (most
- * BitNodes) those tie, and the one adding the most RAM wins.
+ * The fleet is kept level: each step fills an empty slot with a MIN_RAM server
+ * or, once every slot is taken, doubles the smallest server. An upgrade is
+ * priced as the difference between the two sizes, so many small steps cost the
+ * same as one big one, and a level fleet is the cheapest shape in BitNodes
+ * where bigger servers cost more per GB.
  *
- * Usage: run cloud-manager.ts
+ * A step normally spends at most SPEND_FRACTION of current cash and never dips
+ * into CASH_RESERVE. With --yolo both limits are off and every dollar you have
+ * is available to each step.
+ *
+ * Usage:
+ *   run cloud-manager.ts
+ *   run cloud-manager.ts --yolo        spend everything, keep no reserve
+ *
+ * @param {NS} ns
  */
 
-/** Share of current cash one step may spend. */
+/** Share of current cash one step may spend. Ignored with --yolo. */
 const SPEND_FRACTION = 0.2;
-/** Cash that is never spent. */
+/** Cash that is never spent. Ignored with --yolo. */
 const CASH_RESERVE = 5_000_000;
-/** Smallest server worth buying, in GB. */
+/** Size a new server is bought at, in GB. */
 const MIN_RAM = 8;
 const NAME_PREFIX = "pserv";
 
@@ -25,8 +34,16 @@ type Step = {
   act: () => boolean;
 };
 
+type CloudServer = {
+  host: string;
+  ram: number;
+};
+
 export async function main(ns: NS): Promise<void> {
   ns.disableLog("ALL");
+
+  const yolo = Boolean(ns.flags([["yolo", false]]).yolo);
+  if (yolo) ns.print("--yolo: no spend cap, no cash reserve");
 
   const ceiling = ns.cloud.getRamLimit();
   let lastWaiting = "";
@@ -47,15 +64,12 @@ export async function main(ns: NS): Promise<void> {
     }
 
     const cash = ns.getServerMoneyAvailable("home");
-    const budget = Math.max(
-      0,
-      Math.min(cash * SPEND_FRACTION, cash - CASH_RESERVE),
-    );
+    const budget = spendingBudget(cash, yolo);
 
-    const step = bestStep(ns, ceiling, servers, slotsLeft, budget);
+    const step = levelingStep(ns, servers, slotsLeft);
 
-    if (!step) {
-      const waiting = describeNextStep(ns, ceiling, servers, slotsLeft);
+    if (step.cost > budget) {
+      const waiting = `${step.label} costs $${ns.format.number(step.cost)}`;
       if (waiting !== lastWaiting) {
         ns.print(`waiting: ${waiting} | budget $${ns.format.number(budget)}`);
         lastWaiting = waiting;
@@ -78,106 +92,43 @@ export async function main(ns: NS): Promise<void> {
   }
 }
 
+/** Cash one step may spend: all of it with --yolo, else the capped share. */
+function spendingBudget(cash: number, yolo: boolean): number {
+  if (yolo) return cash;
+  return Math.max(0, Math.min(cash * SPEND_FRACTION, cash - CASH_RESERVE));
+}
+
 /**
- * The affordable step with the lowest cost per added GB; ties go to the step
- * adding the most RAM, so linear pricing makes the largest jump.
+ * The one step that keeps the fleet level: fill an empty slot with a MIN_RAM
+ * server, or with every slot taken, double the smallest server.
  */
-function bestStep(
-  ns: NS,
-  ceiling: number,
-  servers: string[],
-  slotsLeft: number,
-  budget: number,
-): Step | null {
-  const steps: Step[] = [];
-
+function levelingStep(ns: NS, servers: string[], slotsLeft: number): Step {
   if (slotsLeft > 0) {
-    const buy = largestAffordable(MIN_RAM, ceiling, budget, (ram) =>
-      ns.cloud.getServerCost(ram),
-    );
-    if (buy) {
-      const name = nextName(servers);
-      steps.push({
-        label: `buy ${name} at ${ns.format.ram(buy.ram)}`,
-        cost: buy.cost,
-        addedRam: buy.ram,
-        act: () => ns.cloud.purchaseServer(name, buy.ram) !== "",
-      });
-    }
-  }
-
-  for (const host of servers) {
-    const current = ns.getServerMaxRam(host);
-    if (current >= ceiling) continue;
-
-    const upgrade = largestAffordable(current * 2, ceiling, budget, (ram) =>
-      ns.cloud.getServerUpgradeCost(host, ram),
-    );
-    if (upgrade) {
-      steps.push({
-        label: `upgrade ${host}: ${ns.format.ram(current)} -> ${ns.format.ram(upgrade.ram)}`,
-        cost: upgrade.cost,
-        addedRam: upgrade.ram - current,
-        act: () => ns.cloud.upgradeServer(host, upgrade.ram),
-      });
-    }
-  }
-
-  steps.sort((a, b) => {
-    const perGb = a.cost / a.addedRam - b.cost / b.addedRam;
-    const tied = Math.abs(perGb) <= 1e-9 * Math.max(a.cost, b.cost);
-    return tied ? b.addedRam - a.addedRam : perGb;
-  });
-  return steps[0] ?? null;
-}
-
-/** Largest power-of-two RAM in [lowest, highest] whose cost fits the budget. */
-function largestAffordable(
-  lowest: number,
-  highest: number,
-  budget: number,
-  costOf: (ram: number) => number,
-): { ram: number; cost: number } | null {
-  for (let ram = highest; ram >= lowest; ram /= 2) {
-    const cost = costOf(ram);
-    if (Number.isFinite(cost) && cost > 0 && cost <= budget) {
-      return { ram, cost };
-    }
-  }
-  return null;
-}
-
-/** The cheapest possible next step, for the waiting message. */
-function describeNextStep(
-  ns: NS,
-  ceiling: number,
-  servers: string[],
-  slotsLeft: number,
-): string {
-  const options: { label: string; cost: number }[] = [];
-
-  if (slotsLeft > 0) {
-    options.push({
-      label: `new ${ns.format.ram(MIN_RAM)} server`,
+    const name = nextName(servers);
+    return {
+      label: `buy ${name} at ${ns.format.ram(MIN_RAM)}`,
       cost: ns.cloud.getServerCost(MIN_RAM),
-    });
-  }
-  for (const host of servers) {
-    const current = ns.getServerMaxRam(host);
-    if (current >= ceiling) continue;
-    options.push({
-      label: `${host} ${ns.format.ram(current)} -> ${ns.format.ram(current * 2)}`,
-      cost: ns.cloud.getServerUpgradeCost(host, current * 2),
-    });
+      addedRam: MIN_RAM,
+      act: () => ns.cloud.purchaseServer(name, MIN_RAM) !== "",
+    };
   }
 
-  const cheapest = options
-    .filter((option) => Number.isFinite(option.cost) && option.cost > 0)
-    .sort((a, b) => a.cost - b.cost)[0];
+  const { host, ram } = smallestServer(ns, servers);
+  return {
+    label: `upgrade ${host}: ${ns.format.ram(ram)} -> ${ns.format.ram(ram * 2)}`,
+    cost: ns.cloud.getServerUpgradeCost(host, ram * 2),
+    addedRam: ram,
+    act: () => ns.cloud.upgradeServer(host, ram * 2),
+  };
+}
 
-  return cheapest
-    ? `${cheapest.label} costs $${ns.format.number(cheapest.cost)}`
-    : "no valid step";
+/** The server with the least RAM; the first one listed wins a tie. */
+function smallestServer(ns: NS, servers: string[]): CloudServer {
+  return servers
+    .map((host) => ({ host, ram: ns.getServerMaxRam(host) }))
+    .reduce((smallest, server) =>
+      server.ram < smallest.ram ? server : smallest,
+    );
 }
 
 function nextName(existing: string[]): string {
