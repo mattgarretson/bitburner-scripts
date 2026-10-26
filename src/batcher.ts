@@ -54,10 +54,6 @@ const QUEUE_AHEAD_MS = 8 * GAP_MS;
 const FULL_BATCH: Config = {
   hackFraction: HACK_FRACTION,
   minimumHackFraction: HACK_FRACTION,
-  homeReserve: HOME_RESERVE_GB,
-  landingGap: GAP_MS,
-  maxBatches: 1,
-  launchLead: LEAD_MS,
   growSafetyMargin: GROW_MARGIN - 1,
 };
 
