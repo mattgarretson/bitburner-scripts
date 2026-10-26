@@ -4,8 +4,8 @@ REPLACE A RUNNING SUITE
   run stop-hacking.ts
 
 START HACKING
-  run multi-manager.ts                                        same as --hack 0.10 --targets 8 --reserve 8
-  run multi-manager.ts --hack 0.25 --targets 12 --reserve 64
+  run multi-manager.ts                same as --reserve 8
+  run multi-manager.ts --reserve 64
 
 WATCH IT
   tail multi-manager.ts            if it was started with no options; otherwise repeat them
@@ -13,11 +13,10 @@ WATCH IT
   run multi-manager.ts --tail      opens the log window as it starts
 
 MULTI-MANAGER OPTIONS
-  --hack 0.10      most of a server's money one batch steals (0.0025 to 0.5)
-  --targets 8      how many servers it hacks at once
   --reserve 8      GB kept free on home
+  Every 15 s it picks by itself how much a batch steals and which servers to hack, from your RAM and hacking level.
   Everything else (landing gap, batches per wave, launch lead, ...) is a constant at the top of multi-manager.ts.
-  Any other option stops it with an "unknown option" error.
+  Any other option, including the old --hack and --targets, stops it with an "unknown option" error.
 
 BATCHER (simpler replacement for multi-manager, on trial; run stop-hacking.ts before switching either way)
   run batcher.ts                     preps every target, then keeps H/W/G/W batches landing on each, best $ per GB of RAM first

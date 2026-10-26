@@ -67,7 +67,8 @@ Write for someone reading top to bottom; Prettier owns layout.
 `multi-manager.ts`. Keep it small: constants only, no flags, no tests. The rules below
 don't apply to it.
 
-`multi-manager.ts` is the multi-target scheduler (`--hack`, `--targets`, `--reserve`);
+`multi-manager.ts` is the multi-target scheduler. Its only flag is `--reserve`: it picks
+its own hack fraction and targets from a model of its batches at every network refresh.
 `hacking-lib.ts` holds what other scripts share with it. `docs/` describes an older
 design: treat it as history. Rules:
 

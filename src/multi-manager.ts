@@ -1,24 +1,25 @@
 /**
  * multi-manager.ts — hacks several servers at once with timed hack/weaken/grow/weaken batches
  *
- * Each loop it reads every target, preps the ones that aren't at minimum
- * security and maximum money, and launches waves of complete batches on the
- * ones that are, best expected $/s first. Everything is planned from that
- * loop's reading, because every hacking level shortens hack, grow and weaken.
- * Batches come first: prep only gets RAM no batch could use, and never RAM a
- * waiting batch will need. A wave that is still landing gets more batches
- * appended behind it whenever its target reads prepped between landings.
- * Once all of a target's workers have ended, it is read again before
- * anything new is planned for it.
+ * Every 15 s it picks how much of a server's money a batch steals, and which
+ * servers to work on: whatever its batch maths says earns the most with the
+ * RAM you have, plus a few more servers to prep next. Each loop it reads
+ * every target, preps the ones that aren't at minimum security and maximum
+ * money, and launches waves of complete batches on the ones that are, best
+ * $ per GB-second first. Everything is planned from that loop's reading,
+ * because every hacking level shortens hack, grow and weaken. Batches come
+ * first: prep only gets RAM no batch could use, and never RAM a waiting batch
+ * will need. A wave that is still landing gets more batches appended behind
+ * it whenever its target reads prepped between landings. Once all of a
+ * target's workers have ended, it is read again before anything new is
+ * planned for it.
  *
  * Uses the RAM of every server you have root on, home last and less
  * --reserve GB. Won't start while another copy is running, and won't kill
  * it either. Targets with workers left over from a previous copy are left
  * alone until those workers end.
  *
- * Usage: run multi-manager.ts [--hack 0.10] [--targets 8] [--reserve 8]
- *   --hack     most of a server's money one batch steals (0.0025 to 0.5)
- *   --targets  how many servers it hacks at once
+ * Usage: run multi-manager.ts [--reserve 8]
  *   --reserve  GB kept free on home
  * Everything else is a constant below.
  *
@@ -44,9 +45,14 @@ const LAUNCH_LEAD_MS = 1_000;
 /** A launch is called off if planning ate the head start down below this. */
 const LAUNCH_SAFETY_MS = 250;
 const NETWORK_REFRESH_MS = 15_000;
-/** Range for --hack. A batch that doesn't fit steals less, down to the minimum. */
+/** How much of a server's money a batch steals: the picker chooses one of these. */
+const HACK_FRACTIONS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9] as const;
+/** A batch too big for the network steals less, down to this. */
 const MIN_HACK_FRACTION = 0.0025;
-const MAX_HACK_FRACTION = 0.5;
+/** The picker only changes fraction for this much more modelled income. */
+const SWITCH_MARGIN = 1.05;
+/** Servers kept beyond those the RAM can keep batching, so the next ones get prepped. */
+const PREP_TARGETS = 3;
 /** Extra grow threads, as a fraction, in case growth comes up a little short. */
 const GROW_SAFETY_MARGIN = 0.02;
 /**
@@ -56,73 +62,44 @@ const GROW_SAFETY_MARGIN = 0.02;
  */
 const SECURITY_TOLERANCE = 1e-6;
 const MONEY_READY_RATIO = 0.999;
+/** A server at this security can't be priced until it has been weakened once. */
+const MAX_SECURITY = 100;
 /** Wait after a group's workers end before reading the target again. */
 const SETTLE_MS = 250;
-/** How long a target sits out after a failed launch or a lost worker. */
+/** How long a target sits out after a failed launch. */
 const BACKOFF_MS = 5_000;
-/** A worker still running this long after its expected end is LATE. */
-const LATE_TOLERANCE_MS = 2_000;
-/** A worker gone more than this long before its expected end is LOST. */
-const EARLY_TOLERANCE_MS = 500;
-/** Prep targets that have waited this long go to the front of the prep queue. */
-const PREP_AGING_MS = 60_000;
 /** Most groups launched per loop, and the time allowed for launching them. */
 const LAUNCHES_PER_LOOP = 4;
 const LAUNCH_BUDGET_MS = 500;
 /** The loop sleeps until something is due, within these bounds. */
 const MIN_SLEEP_MS = 200;
 const MAX_SLEEP_MS = 1_000;
-/** Workers not yet due to end are checked this often, to catch early deaths. */
-const FULL_CHECK_MS = 2_000;
 /** Starts every group id (worker arg 3), so a restarted manager finds its workers. */
 const TAG = "mm";
 /** RAM is counted in hundredths of a GB, so free-RAM comparisons are exact. */
 const UNITS_PER_GB = 100;
 const WORKER_FILE_LIST: readonly string[] = Object.values(WORKER_FILES);
 
-/** The phase a target must still be in when each kind of group launches. */
-const READY_PHASE = {
-  batch: "BATCH_READY",
-  "money-prep": "MONEY_PREP_READY",
-  "security-prep": "SECURITY_PREP_READY",
+/**
+ * Where a target is, and what the status window calls it: waiting for a
+ * reading, ready for prep or batches, with a group in flight, settling after
+ * one, or sitting out after a failed launch.
+ */
+const PHASES = {
+  NEEDS_OBSERVATION: "reading",
+  UNAVAILABLE: "can't hack",
+  SECURITY_PREP_READY: "needs weaken",
+  MONEY_PREP_READY: "needs grow",
+  BATCH_READY: "ready",
+  PREP_IN_FLIGHT: "prepping",
+  BATCH_IN_FLIGHT: "batching",
+  SETTLING: "settling",
+  BACKOFF: "backing off",
 } as const;
 
-type Purpose = keyof typeof READY_PHASE;
-type Settings = {
-  hackFraction: number;
-  maxTargets: number;
-  homeReserve: number;
-};
-
-/**
- * Where a target is: waiting for a reading, ready for prep or batches, with a
- * group in flight, settling after one, or sitting out after a failure.
- */
-type Phase =
-  | "NEEDS_OBSERVATION"
-  | "UNAVAILABLE"
-  | "SECURITY_PREP_READY"
-  | "MONEY_PREP_READY"
-  | "BATCH_READY"
-  | "PREP_IN_FLIGHT"
-  | "BATCH_IN_FLIGHT"
-  | "SETTLING"
-  | "BACKOFF";
-
-/** Why a target got nothing, shown when RAM sits idle. */
-type ReasonCode =
-  | "NO_ELIGIBLE_TARGETS"
-  | "ALL_TARGETS_BUSY"
-  | "WAITING_FOR_OBSERVATION"
-  | "LAUNCH_BACKOFF"
-  | "NO_PROFITABLE_BATCH"
-  | "COMPLETE_BATCH_TOO_LARGE"
-  | "PREP_GROUP_TOO_LARGE"
-  | "RESERVED_FOR_BATCH_WINDOW"
-  | "RUNNER_FRAGMENTATION"
-  | "BELOW_SMALLEST_THREAD"
-  | "WORKERS_NOT_DEPLOYED"
-  | "INVALID_PLAN";
+type Phase = keyof typeof PHASES;
+type Purpose = "batch" | "money-prep" | "security-prep";
+type Settings = { homeReserve: number };
 
 type Observation = {
   valid: boolean;
@@ -138,9 +115,8 @@ type Observation = {
 type Economics = {
   /** Sized for it at minimum security; null if no batch can be built. */
   batch: Batch | null;
-  moneyPerSecond: number;
-  /** Prep queue order: moneyPerSecond, or max money per weaken-second without a batch. */
-  prepPriority: number;
+  /** Expected $ per GB-second of RAM its batch holds; 0 without a batch. */
+  score: number;
   moneyPrep: {
     growThreadsNeeded: number;
     growSecurityPerThread: number;
@@ -161,10 +137,6 @@ type Target = {
   settleAfter: number;
   backoffUntil: number;
   waitingSince: number;
-  /** "Complete batch too large" rejections since its last batch launched. */
-  batchTooLargeCount: number;
-  /** Times its hack fraction has been cut by 0.8 because batches didn't fit. */
-  batchSizeNotches: number;
   /** Batches in its current chain; appended batches are numbered on from here. */
   scheduledBatchCount: number;
 };
@@ -196,15 +168,15 @@ type Group = {
 /** Some of a job's threads, placed on one server. */
 type Fragment = { job: Job; host: string; threads: number; units: number };
 
-/** A group placed on servers, or why it doesn't fit. */
+/** A group placed on servers, or the RAM it needs that isn't there. */
 type Placement =
   | { ok: true; group: Group; fragments: Fragment[] }
-  | { ok: false; code: ReasonCode; requiredUnits: number };
+  | { ok: false; requiredUnits: number };
 
-/** A rooted server's free RAM. Without the worker files, its RAM is blocked. */
-type Runner = { host: string; units: number; blockedUnits: number };
+/** Free RAM on a server with the worker files. */
+type Runner = { host: string; units: number };
 
-/** A launched worker process. */
+/** A launched worker process, kept until it ends. */
 type Receipt = {
   groupId: string;
   target: string;
@@ -212,16 +184,7 @@ type Receipt = {
   pid: number;
   units: number;
   endsAt: number;
-  status: "running" | "late" | "finished" | "lost";
 };
-
-/** Launched workers, and per group how many went late or were lost. */
-type InFlight = {
-  receipts: Receipt[];
-  faults: Map<string, { lost: number; late: number }>;
-};
-
-type Reason = { host: string; code: ReasonCode };
 
 type Decision =
   | {
@@ -229,9 +192,8 @@ type Decision =
       target: Target;
       group: Group;
       fragments: Fragment[];
-      reasons: Reason[];
     }
-  | { kind: "idle"; dominantReason: ReasonCode; reasons: Reason[] };
+  | { kind: "idle" };
 
 /** When a new wave can launch to land right behind a running chain. */
 type AppendWindow = { lastEndAt: number; launchAt: number };
@@ -244,9 +206,22 @@ type PlanContext = {
   serial: number;
 };
 
+/** What batches stealing one hack fraction would earn, by the picker's model. */
+type FractionPlan = {
+  fraction: number;
+  /** The targets it can price, best $/GB-s first. */
+  ranked: string[];
+  /** How many of them the RAM can keep batching. */
+  fed: number;
+  /** Modelled $/s with those targets batching flat out. */
+  income: number;
+};
+
 type State = {
   settings: Settings;
   workers: Workers;
+  /** Picked at each network refresh; 0 until the first. */
+  hackFraction: number;
   hosts: string[];
   deployedHosts: Set<string>;
   /** Rooted servers with the worker files, as of the last network refresh. */
@@ -255,10 +230,10 @@ type State = {
   capacityRam: number;
   runners: Runner[];
   targets: Map<string, Target>;
-  inFlight: InFlight;
+  /** Launched workers that haven't ended yet. */
+  inFlight: Receipt[];
   previousWorkers: Array<{ host: string; pid: number; target: string }>;
   nextNetworkRefresh: number;
-  nextFullCheck: number;
   loops: number;
   startedAt: number;
   launched: number;
@@ -292,7 +267,7 @@ export async function main(ns: NS): Promise<void> {
     const now = Date.now();
     if (now >= state.nextNetworkRefresh) refreshNetwork(ns, state);
 
-    checkWorkers(ns, state, now);
+    state.inFlight = dropEndedWorkers(ns, state.inFlight, now);
     releaseAdoptedTargets(ns, state);
     closeFinishedGroups(state.targets, state.inFlight, now);
     state.runners = readRunners(ns, state);
@@ -307,20 +282,8 @@ export async function main(ns: NS): Promise<void> {
 // --- Startup and the network --------------------------------------------------
 
 function readSettings(ns: NS): Settings {
-  const flags = ns.flags([
-    ["targets", 8],
-    ["hack", 0.1],
-    ["reserve", 8],
-  ]);
-  const hack = Number(flags.hack);
-
-  return {
-    hackFraction: Number.isFinite(hack)
-      ? Math.min(MAX_HACK_FRACTION, Math.max(MIN_HACK_FRACTION, hack))
-      : MIN_HACK_FRACTION,
-    maxTargets: Math.max(1, Math.floor(Number(flags.targets) || 8)),
-    homeReserve: Math.max(0, Number(flags.reserve) || 0),
-  };
+  const flags = ns.flags([["reserve", 8]]);
+  return { homeReserve: Math.max(0, Number(flags.reserve) || 0) };
 }
 
 /** The PID of another copy of this script on home, if one is running. */
@@ -336,16 +299,16 @@ function newState(settings: Settings, workers: Workers): State {
   return {
     settings,
     workers,
+    hackFraction: 0,
     hosts: ["home"],
     deployedHosts: new Set(),
     workerHosts: new Set(["home"]),
     capacityRam: 0,
     runners: [],
     targets: new Map(),
-    inFlight: { receipts: [], faults: new Map() },
+    inFlight: [],
     previousWorkers: [],
     nextNetworkRefresh: 0,
-    nextFullCheck: 0,
     loops: 0,
     startedAt: Date.now(),
     launched: 0,
@@ -366,7 +329,7 @@ function refreshNetwork(ns: NS, state: State): void {
   state.workerHosts = capacity.workerHosts;
   state.capacityRam = capacity.ram;
   state.nextNetworkRefresh = Date.now() + NETWORK_REFRESH_MS;
-  trackBestTargets(ns, state);
+  pickTargets(ns, state);
 }
 
 /**
@@ -396,40 +359,108 @@ export function measureCapacity(
 }
 
 /**
- * Tracks the --targets servers with the best expected $/s, and never drops one
- * that still has work in flight. A server at 100 security can't be modelled,
- * so until it is prepped it scores max money per second of weaken time.
+ * Picks the hack fraction whose batches would earn the most with this
+ * network's RAM, and tracks the targets that plan keeps batching plus
+ * PREP_TARGETS more to prep next. A target with work in flight is never
+ * dropped.
  */
-function trackBestTargets(ns: NS, state: State): void {
-  const sizing = batchSizing(state.settings.hackFraction);
+function pickTargets(ns: NS, state: State): void {
+  const hosts = state.hosts.filter((host) => isMoneyTarget(ns, host));
   const ram = state.capacityRam;
-  const scored: Array<{ host: string; score: number }> = [];
-
-  for (const host of state.hosts) {
-    if (!isMoneyTarget(ns, host)) continue;
-
-    const batch = buildPreparedBatch(ns, host, state.workers, sizing, ram);
-    if (batch) {
-      scored.push({ host, score: wavesMoneyPerSecond(batch, ram) });
-    } else if (ns.getServerSecurityLevel(host) >= 100) {
-      const weakenSeconds = Math.max(0.001, ns.getWeakenTime(host) / 1_000);
-      scored.push({ host, score: ns.getServerMaxMoney(host) / weakenSeconds });
+  const plans = HACK_FRACTIONS.map((fraction) => {
+    const sizing = batchSizing(fraction);
+    const priced: Array<{ host: string; batch: Batch }> = [];
+    for (const host of hosts) {
+      const batch = buildPreparedBatch(ns, host, state.workers, sizing, ram);
+      if (batch) priced.push({ host, batch });
     }
-  }
+    return planFraction(fraction, priced, ram);
+  });
 
-  const best = scored
-    .sort((a, b) => b.score - a.score || a.host.localeCompare(b.host))
-    .slice(0, state.settings.maxTargets)
-    .map((row) => row.host);
+  const plan = choosePlan(plans, state.hackFraction);
+  state.hackFraction = plan.fraction;
+  const keep = targetsToKeep(plan, unpricedHosts(ns, hosts));
 
-  for (const host of best) {
+  for (const host of keep) {
     if (!state.targets.has(host)) state.targets.set(host, newTarget(host));
   }
   for (const [host, target] of state.targets) {
     const busy =
-      target.activeGroupId !== null || hasLiveReceipts(state.inFlight, host);
-    if (!best.includes(host) && !busy) state.targets.delete(host);
+      target.activeGroupId !== null || hasWorkersInFlight(state.inFlight, host);
+    if (!keep.includes(host) && !busy) state.targets.delete(host);
   }
+}
+
+/**
+ * What batches stealing `fraction` would earn with `ram`: best $/GB-s first,
+ * each target batching flat out (one batch every four gaps) until the RAM
+ * runs out.
+ */
+export function planFraction(
+  fraction: number,
+  priced: Array<{ host: string; batch: Batch }>,
+  ram: number,
+): FractionPlan {
+  const ranked = [...priced].sort(
+    (a, b) =>
+      moneyPerGbSecond(b.batch) - moneyPerGbSecond(a.batch) ||
+      compareText(a.host, b.host),
+  );
+  const cycleMs = 4 * LANDING_GAP_MS;
+  let free = ram;
+  let income = 0;
+  let fed = 0;
+
+  for (const { batch } of ranked) {
+    if (free <= 0) break;
+    // Flat out, a target holds one batch's RAM per cycle of the batch's hold.
+    const flatOutRam = (batch.ramNeeded * batchHoldMs(batch)) / cycleMs;
+    const share = Math.min(1, free / flatOutRam);
+    income += ((batch.expectedMoney * 1_000) / cycleMs) * share;
+    free -= flatOutRam * share;
+    fed++;
+  }
+  return { fraction, ranked: ranked.map(({ host }) => host), fed, income };
+}
+
+/**
+ * The plan that earns the most, unless the current fraction's plan is within
+ * SWITCH_MARGIN of it, so near-ties don't flip back and forth.
+ */
+export function choosePlan(
+  plans: FractionPlan[],
+  currentFraction: number,
+): FractionPlan {
+  const best = plans.reduce((a, b) => (b.income > a.income ? b : a));
+  const current = plans.find((plan) => plan.fraction === currentFraction);
+  if (current && best.income <= current.income * SWITCH_MARGIN) return current;
+  return best;
+}
+
+/**
+ * The targets a plan keeps batching, then PREP_TARGETS more to prep. Servers
+ * that can't be priced yet get those prep slots first: one weaken lets them
+ * be priced, and they are often the richest.
+ */
+export function targetsToKeep(
+  plan: FractionPlan,
+  unpriced: string[],
+): string[] {
+  const batching = plan.ranked.slice(0, plan.fed);
+  const toPrep = [...unpriced, ...plan.ranked.slice(plan.fed)];
+  return [...batching, ...toPrep.slice(0, PREP_TARGETS)];
+}
+
+/** Servers at maximum security, most max money per weaken-second first. */
+function unpricedHosts(ns: NS, hosts: string[]): string[] {
+  return hosts
+    .filter((host) => ns.getServerSecurityLevel(host) >= MAX_SECURITY)
+    .map((host) => ({
+      host,
+      value: ns.getServerMaxMoney(host) / ns.getWeakenTime(host),
+    }))
+    .sort((a, b) => b.value - a.value)
+    .map((row) => row.host);
 }
 
 /**
@@ -457,33 +488,16 @@ export function adoptPreviousWorkers(ns: NS, state: State): void {
 
 // --- Each loop ----------------------------------------------------------------
 
-/**
- * Marks each launched worker running, late, lost or finished. Workers not yet
- * due to end are only checked every FULL_CHECK_MS, to catch early deaths.
- */
-export function checkWorkers(ns: NS, state: State, now: number): void {
-  const { inFlight } = state;
-  const fullCheck = now >= state.nextFullCheck;
-  if (fullCheck) state.nextFullCheck = now + FULL_CHECK_MS;
-
-  for (const receipt of inFlight.receipts) {
-    if (!isLive(receipt)) continue;
-    if (!fullCheck && now < receipt.endsAt) continue;
-
-    const running = ns.isRunning(receipt.pid, receipt.host);
-    const status = workerStatus(receipt, running, now);
-    if (status === receipt.status) continue;
-
-    if (status === "lost" || status === "late") {
-      const faults = inFlight.faults.get(receipt.groupId) ?? {
-        lost: 0,
-        late: 0,
-      };
-      faults[status]++;
-      inFlight.faults.set(receipt.groupId, faults);
-    }
-    receipt.status = status;
-  }
+/** The launched workers still running. A worker is only checked once it is due. */
+export function dropEndedWorkers(
+  ns: NS,
+  inFlight: Receipt[],
+  now: number,
+): Receipt[] {
+  return inFlight.filter(
+    (receipt) =>
+      now < receipt.endsAt || ns.isRunning(receipt.pid, receipt.host),
+  );
 }
 
 /** Once all of a target's previous-copy workers have ended, it is read fresh. */
@@ -508,12 +522,11 @@ function releaseAdoptedTargets(ns: NS, state: State): void {
 
 /**
  * Moves targets on once their wait is over. SETTLING and BACKOFF end in a
- * fresh reading. A group whose workers have all stopped ends in SETTLING, or
- * in BACKOFF if any were lost. Stopped workers are then dropped.
+ * fresh reading, and a group whose workers have all ended goes to SETTLING.
  */
 export function closeFinishedGroups(
   targets: Map<string, Target>,
-  inFlight: InFlight,
+  inFlight: Receipt[],
   now: number,
 ): void {
   for (const target of targets.values()) {
@@ -531,34 +544,20 @@ export function closeFinishedGroups(
 
     const groupId = target.activeGroupId;
     if (groupId === null || groupId === "recovered") continue;
-    const workers = inFlight.receipts.filter((r) => r.groupId === groupId);
-    if (workers.length === 0 || workers.some(isLive)) continue;
+    if (inFlight.some((receipt) => receipt.groupId === groupId)) continue;
 
-    if ((inFlight.faults.get(groupId)?.lost ?? 0) > 0) {
-      backOff(target, now);
-    } else {
-      target.phase = "SETTLING";
-      target.settleAfter = now + SETTLE_MS;
-    }
-    inFlight.faults.delete(groupId);
+    target.phase = "SETTLING";
+    target.settleAfter = now + SETTLE_MS;
   }
-
-  inFlight.receipts = inFlight.receipts.filter(isLive);
 }
 
-/** Free RAM on every rooted server, less the home reserve. */
+/** Free RAM on every server with the worker files, less the home reserve. */
 export function readRunners(ns: NS, state: State): Runner[] {
-  return state.hosts
-    .filter((host) => ns.hasRootAccess(host) && ns.getServerMaxRam(host) > 0)
-    .map((host) => {
-      const reserve = host === "home" ? state.settings.homeReserve : 0;
-      const free =
-        ns.getServerMaxRam(host) - ns.getServerUsedRam(host) - reserve;
-      const units = toUnits(Math.max(0, free));
-      return state.workerHosts.has(host)
-        ? { host, units, blockedUnits: 0 }
-        : { host, units: 0, blockedUnits: units };
-    });
+  return [...state.workerHosts].map((host) => {
+    const reserve = host === "home" ? state.settings.homeReserve : 0;
+    const free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host) - reserve;
+    return { host, units: toUnits(Math.max(0, free)) };
+  });
 }
 
 /**
@@ -573,12 +572,12 @@ export function readTargets(ns: NS, state: State, now: number): void {
       continue;
     }
     if (target.activeGroupId !== null) continue;
-    if (hasLiveReceipts(state.inFlight, target.host)) continue;
+    if (hasWorkersInFlight(state.inFlight, target.host)) continue;
     if (target.phase === "SETTLING" || target.phase === "BACKOFF") continue;
 
     const observation = observe(ns, target.host);
     const economics = observation.valid
-      ? computeEconomics(ns, state, target, observation)
+      ? computeEconomics(ns, state, target.host, observation)
       : null;
     recordObservation(target, observation, economics, now);
   }
@@ -593,7 +592,7 @@ function readRunningChain(ns: NS, state: State, target: Target): void {
   const observation = observe(ns, target.host);
   target.observation = observation;
   if (!readsPrepped(target)) return;
-  target.economics = computeEconomics(ns, state, target, observation);
+  target.economics = computeEconomics(ns, state, target.host, observation);
 }
 
 /** A reading; invalid if the target can't be hacked for money now. */
@@ -626,16 +625,10 @@ function observe(ns: NS, host: string): Observation {
 export function computeEconomics(
   ns: NS,
   state: State,
-  target: Target,
+  host: string,
   observation: Observation,
 ): Economics {
-  const { host } = target;
-  // Each notch from batches not fitting cuts what a batch steals by a fifth.
-  const hackFraction = Math.max(
-    MIN_HACK_FRACTION,
-    state.settings.hackFraction * Math.pow(0.8, target.batchSizeNotches),
-  );
-  const sizing = batchSizing(hackFraction);
+  const sizing = batchSizing(state.hackFraction);
   const batch = buildPreparedBatch(
     ns,
     host,
@@ -643,9 +636,6 @@ export function computeEconomics(
     sizing,
     state.capacityRam,
   );
-  const moneyPerSecond = batch
-    ? wavesMoneyPerSecond(batch, state.capacityRam)
-    : 0;
   const weakenPerThread = ns.weakenAnalyze(1, 1);
 
   // No hostname on growthAnalyzeSecurity: passing one caps the answer against
@@ -660,15 +650,11 @@ export function computeEconomics(
   if (!Number.isFinite(growThreadsNeeded) || growThreadsNeeded < 1) {
     growThreadsNeeded = 1;
   }
-  const { security, minSecurity, maxMoney, growTime, weakenTime } = observation;
+  const { security, minSecurity, growTime, weakenTime } = observation;
 
   return {
     batch,
-    moneyPerSecond,
-    prepPriority:
-      moneyPerSecond > 0
-        ? moneyPerSecond
-        : Math.max(0, maxMoney) / Math.max(0.001, weakenTime / 1_000),
+    score: batch ? moneyPerGbSecond(batch) : 0,
     moneyPrep: {
       growThreadsNeeded,
       growSecurityPerThread,
@@ -702,7 +688,6 @@ function launchWhatFits(ns: NS, state: State): Decision {
       now,
       serial: state.launched,
     });
-    noteBatchesTooLarge(state.targets, decision);
     if (!launchDecision(ns, state, decision, now)) return decision;
 
     launches++;
@@ -711,31 +696,6 @@ function launchWhatFits(ns: NS, state: State): Decision {
     if (launches >= LAUNCHES_PER_LOOP || elapsed >= LAUNCH_BUDGET_MS) {
       return decision;
     }
-  }
-}
-
-/**
- * Every third "complete batch too large" since a target's last batch cuts its
- * hack fraction another notch, and has it read again to resize its batch.
- */
-export function noteBatchesTooLarge(
-  targets: Map<string, Target>,
-  decision: Decision,
-): void {
-  const hosts = new Set(
-    decision.reasons
-      .filter((reason) => reason.code === "COMPLETE_BATCH_TOO_LARGE")
-      .map((reason) => reason.host),
-  );
-
-  for (const host of hosts) {
-    const target = targets.get(host);
-    if (!target || target.activeGroupId !== null) continue;
-
-    target.batchTooLargeCount++;
-    const notches = Math.floor(target.batchTooLargeCount / 3);
-    if (notches > target.batchSizeNotches) target.phase = "NEEDS_OBSERVATION";
-    target.batchSizeNotches = notches;
   }
 }
 
@@ -749,7 +709,7 @@ export function launchDecision(
   if (decision.kind === "idle") return false;
   const { target, group, fragments } = decision;
 
-  const launch = launchGroup(ns, group, fragments, state.settings.homeReserve);
+  const launch = launchGroup(ns, group, fragments);
   if (!launch.ok) {
     state.launchFailures++;
     state.lastLaunch = `FAILED ${target.host}: ${launch.reason}`;
@@ -758,7 +718,7 @@ export function launchDecision(
     return false;
   }
 
-  state.inFlight.receipts.push(...launch.receipts);
+  state.inFlight.push(...launch.receipts);
   markLaunched(target, group);
   state.launched++;
   state.lastLaunch = `${describeGroup(group)} on ${launch.receipts.length} pid(s)`;
@@ -766,15 +726,13 @@ export function launchDecision(
 }
 
 /**
- * Launches every fragment of a group in delay order, or nothing at all. The
- * plan is first re-checked against live RAM, worker files and the target, and
- * if any exec fails, everything already started is killed.
+ * Launches every fragment of a group in delay order, or nothing at all: if
+ * any exec fails, everything already started is killed.
  */
 export function launchGroup(
   ns: NS,
   group: Group,
   fragments: Fragment[],
-  homeReserve: number,
 ): { ok: true; receipts: Receipt[] } | { ok: false; reason: string } {
   const plannedAt = Date.now();
   const skew = plannedAt - group.plannedAt;
@@ -784,28 +742,6 @@ export function launchGroup(
       reason: `planning consumed ${skew}ms of the ${LAUNCH_LEAD_MS}ms lead`,
     };
   }
-
-  const needed = new Map<string, number>();
-  for (const { host, threads, job } of fragments) {
-    needed.set(host, (needed.get(host) ?? 0) + threads * job.worker.ram);
-  }
-  for (const [host, ram] of needed) {
-    const reserve = host === "home" ? homeReserve : 0;
-    const free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host) - reserve;
-    if (free + 1e-9 < ram) {
-      return { ok: false, reason: `${host} free RAM changed during planning` };
-    }
-  }
-  for (const host of needed.keys()) {
-    if (host === "home" || hasWorkerFiles(ns, host)) continue;
-    return {
-      ok: false,
-      reason: `${host} worker files changed during planning`,
-    };
-  }
-
-  const moved = targetMoved(ns, group);
-  if (moved) return { ok: false, reason: moved };
 
   const receipts: Receipt[] = [];
   const ordered = [...fragments].sort((a, b) => a.job.delay - b.job.delay);
@@ -831,37 +767,10 @@ export function launchGroup(
       pid,
       units,
       endsAt: plannedAt + job.delay + job.duration,
-      status: "running",
     });
   }
 
   return { ok: true, receipts };
-}
-
-/** Why the target no longer suits the group planned for it, if it doesn't. */
-function targetMoved(ns: NS, group: Group): string | null {
-  let actual: Phase;
-  try {
-    const server = ns.getServer(group.target);
-    const maxMoney = server.moneyMax ?? 0;
-    const security = server.hackDifficulty ?? 100;
-    actual = classify({
-      valid:
-        server.hasAdminRights === true &&
-        !server.purchasedByPlayer &&
-        maxMoney > 0,
-      money: server.moneyAvailable ?? 0,
-      maxMoney,
-      security,
-      minSecurity: server.minDifficulty ?? security,
-    });
-  } catch {
-    return `${group.target} target read failed at launch`;
-  }
-
-  const expected = READY_PHASE[group.purpose];
-  if (actual === expected) return null;
-  return `target state moved from ${expected} to ${actual}`;
 }
 
 /**
@@ -872,8 +781,8 @@ function targetMoved(ns: NS, group: Group): string | null {
 function nextWakeDelay(state: State, now: number): number {
   let wakeAt = Math.min(now + MAX_SLEEP_MS, state.nextNetworkRefresh);
 
-  for (const receipt of state.inFlight.receipts) {
-    if (isLive(receipt)) wakeAt = Math.min(wakeAt, receipt.endsAt);
+  for (const receipt of state.inFlight) {
+    wakeAt = Math.min(wakeAt, receipt.endsAt);
   }
   for (const target of state.targets.values()) {
     if (target.phase === "SETTLING") {
@@ -898,45 +807,30 @@ function nextWakeDelay(state: State, now: number): number {
  * else the best prep that fits without holding RAM a waiting batch needs.
  * An append whose target is mid-landing reads prepped again within one batch
  * cycle, so the RAM its wave needs is held and only work that fits around it
- * launches. Every target that gets nothing gets a reason.
+ * launches.
  */
 export function decide(
   targets: Target[],
-  inFlight: InFlight,
+  inFlight: Receipt[],
   ctx: PlanContext,
 ): Decision {
-  const reasons: Reason[] = [];
-
   const candidates: Array<{ target: Target; window: AppendWindow | null }> = [];
   for (const target of targets) {
     const window = appendWindow(target, inFlight);
     if (window) {
       if (ctx.now >= window.launchAt) candidates.push({ target, window });
-      else reasons.push({ host: target.host, code: "ALL_TARGETS_BUSY" });
       continue;
     }
-
-    const blocked = ineligibleReason(target, inFlight);
-    if (blocked) {
-      reasons.push({ host: target.host, code: blocked });
-      continue;
-    }
-    if (target.phase !== "BATCH_READY") continue;
-    if (!target.economics?.batch || target.economics.moneyPerSecond <= 0) {
-      reasons.push({ host: target.host, code: "NO_PROFITABLE_BATCH" });
-      continue;
-    }
-    candidates.push({ target, window: null });
+    if (target.phase !== "BATCH_READY" || !isIdle(target, inFlight)) continue;
+    if (scoreOf(target) > 0) candidates.push({ target, window: null });
   }
   candidates.sort(
     (a, b) =>
-      (b.target.economics?.moneyPerSecond ?? 0) -
-        (a.target.economics?.moneyPerSecond ?? 0) ||
+      scoreOf(b.target) - scoreOf(a.target) ||
       compareText(a.target.host, b.target.host),
   );
 
   let runners = ctx.runners;
-  let holding = false;
   let waitingBatchUnits: number | null = null;
   for (const { target, window } of candidates) {
     const batch = target.economics?.batch;
@@ -944,114 +838,74 @@ export function decide(
 
     const wave = planWave(target, batch, window, { ...ctx, runners });
     if (wave.ok && window && !readsPrepped(target)) {
-      reasons.push({ host: target.host, code: "RESERVED_FOR_BATCH_WINDOW" });
       runners = withoutFragments(runners, wave.fragments);
-      holding = true;
       continue;
     }
     if (wave.ok) {
       const { group, fragments } = wave;
-      return { kind: "batch", target, group, fragments, reasons };
+      return { kind: "batch", target, group, fragments };
     }
-    // Held RAM is spoken for only until the next batch cycle, so a wave it
-    // crowds out isn't counted as too large (that would shrink its batches).
-    const code = window || holding ? "RESERVED_FOR_BATCH_WINDOW" : wave.code;
-    reasons.push({ host: target.host, code });
     waitingBatchUnits ??= wave.requiredUnits;
   }
 
   const prepCtx = { ...ctx, runners };
   const freeUnits = runners.reduce((sum, runner) => sum + runner.units, 0);
   const prepTargets = targets
-    .filter(
-      (target) =>
-        isPrepPhase(target.phase) &&
-        ineligibleReason(target, inFlight) === null,
-    )
-    .sort(prepOrder(ctx.now));
+    .filter((target) => isPrepPhase(target.phase) && isIdle(target, inFlight))
+    .sort(byPrepOrder);
   for (const target of prepTargets) {
     const prep = planPrep(target, prepCtx);
-    if (!prep.ok) {
-      reasons.push({ host: target.host, code: prep.code });
-      continue;
-    }
+    if (!prep.ok) continue;
     const { group, fragments } = prep;
     if (!leavesBatchWindow(group, waitingBatchUnits, inFlight, freeUnits)) {
-      reasons.push({ host: target.host, code: "RESERVED_FOR_BATCH_WINDOW" });
       continue;
     }
-    return { kind: "prep", target, group, fragments, reasons };
+    return { kind: "prep", target, group, fragments };
   }
 
-  const dominant = dominantReason(reasons, targets.length);
-  return { kind: "idle", dominantReason: dominant, reasons };
+  return { kind: "idle" };
 }
 
-/** Why a target can't take a new group right now, or null if it can. */
-export function ineligibleReason(
-  target: Target,
-  inFlight: InFlight,
-): ReasonCode | null {
-  const { phase } = target;
-  const busy =
-    target.activeGroupId !== null || hasLiveReceipts(inFlight, target.host);
-
-  if (busy || phase === "PREP_IN_FLIGHT" || phase === "BATCH_IN_FLIGHT")
-    return "ALL_TARGETS_BUSY";
-  if (phase === "SETTLING") return "ALL_TARGETS_BUSY";
-  // closeFinishedGroups() ends a backoff at the start of a loop.
-  if (phase === "BACKOFF") return "LAUNCH_BACKOFF";
-  if (phase === "NEEDS_OBSERVATION" || target.observation === null)
-    return "WAITING_FOR_OBSERVATION";
-  if (phase === "UNAVAILABLE") return "NO_ELIGIBLE_TARGETS";
-  return null;
+/** Whether a target has nothing in flight and no group it is waiting on. */
+export function isIdle(target: Target, inFlight: Receipt[]): boolean {
+  return (
+    target.activeGroupId === null && !hasWorkersInFlight(inFlight, target.host)
+  );
 }
 
 /**
  * When the next wave can launch behind a target's running batch chain, timed
  * so its first hack lands one gap after the chain's last landing. Null when
- * the chain can't take more: nothing of it is left in flight, or a worker
- * went late or was lost.
+ * nothing of the chain is left in flight.
  */
 export function appendWindow(
   target: Target,
-  inFlight: InFlight,
+  inFlight: Receipt[],
 ): AppendWindow | null {
   const batch = target.economics?.batch;
   const groupId = target.activeGroupId;
   if (target.phase !== "BATCH_IN_FLIGHT" || !batch) return null;
   if (groupId === null || groupId === "recovered") return null;
 
-  const faults = inFlight.faults.get(groupId);
-  if (faults && (faults.lost > 0 || faults.late > 0)) return null;
-
-  const live = inFlight.receipts.filter(
-    (r) => r.groupId === groupId && r.target === target.host && isLive(r),
+  const chain = inFlight.filter(
+    (r) => r.groupId === groupId && r.target === target.host,
   );
-  if (live.length === 0) return null;
+  if (chain.length === 0) return null;
 
-  const lastEndAt = Math.max(...live.map((receipt) => receipt.endsAt));
+  const lastEndAt = Math.max(...chain.map((receipt) => receipt.endsAt));
   return {
     lastEndAt,
     launchAt: lastEndAt + LANDING_GAP_MS - LAUNCH_LEAD_MS - batch.weakenTime,
   };
 }
 
-/**
- * Prep queue order. Targets that have waited PREP_AGING_MS go first, so a
- * rich newcomer can't starve them; then prep priority, then longest waiting.
- */
-function prepOrder(now: number): (a: Target, b: Target) => number {
-  const aged = (target: Target): number =>
-    now - target.waitingSince >= PREP_AGING_MS ? 1 : 0;
-  const priority = (target: Target): number =>
-    target.economics?.prepPriority ?? 0;
-
-  return (a, b) =>
-    aged(b) - aged(a) ||
-    priority(b) - priority(a) ||
+/** Prep queue order: best $/GB-s first, unpriced targets last, then longest waiting. */
+function byPrepOrder(a: Target, b: Target): number {
+  return (
+    scoreOf(b) - scoreOf(a) ||
     a.waitingSince - b.waitingSince ||
-    compareText(a.host, b.host);
+    compareText(a.host, b.host)
+  );
 }
 
 /**
@@ -1062,7 +916,7 @@ function prepOrder(now: number): (a: Target, b: Target) => number {
 export function leavesBatchWindow(
   prep: Group,
   waitingBatchUnits: number | null,
-  inFlight: InFlight,
+  inFlight: Receipt[],
   freeUnits: number,
 ): boolean {
   if (waitingBatchUnits === null) return true;
@@ -1076,8 +930,8 @@ export function leavesBatchWindow(
   // Prep that has given its RAM back before the window can't delay anything.
   if (prep.lastEndAt <= windowStart) return true;
 
-  const releasedByThen = inFlight.receipts
-    .filter((receipt) => isLive(receipt) && receipt.endsAt <= windowStart)
+  const releasedByThen = inFlight
+    .filter((receipt) => receipt.endsAt <= windowStart)
     .reduce((sum, receipt) => sum + receipt.units, 0);
   const freeAtWindow = freeUnits + releasedByThen - requiredUnits(prep.jobs);
   return freeAtWindow >= waitingBatchUnits;
@@ -1085,37 +939,17 @@ export function leavesBatchWindow(
 
 /** When enough in-flight RAM will be back to cover `units`, or null if never. */
 export function earliestReleaseTime(
-  inFlight: InFlight,
+  inFlight: Receipt[],
   units: number,
 ): number | null {
-  const live = inFlight.receipts
-    .filter(isLive)
-    .sort((a, b) => a.endsAt - b.endsAt);
+  const byEnd = [...inFlight].sort((a, b) => a.endsAt - b.endsAt);
 
   let released = 0;
-  for (const receipt of live) {
+  for (const receipt of byEnd) {
     released += receipt.units;
     if (released >= units) return receipt.endsAt;
   }
   return null;
-}
-
-/** The most common reason; ties go to the alphabetically first. */
-function dominantReason(reasons: Reason[], targetCount: number): ReasonCode {
-  if (targetCount === 0 || reasons.length === 0) return "NO_ELIGIBLE_TARGETS";
-
-  const counts = new Map<ReasonCode, number>();
-  for (const { code } of reasons) counts.set(code, (counts.get(code) ?? 0) + 1);
-
-  let best: ReasonCode = "NO_ELIGIBLE_TARGETS";
-  let bestCount = -1;
-  for (const [code, count] of counts) {
-    if (count > bestCount || (count === bestCount && code < best)) {
-      best = code;
-      bestCount = count;
-    }
-  }
-  return best;
 }
 
 // --- Planning groups ----------------------------------------------------------
@@ -1175,11 +1009,7 @@ export function planWave(
 export function planPrep(target: Target, ctx: PlanContext): Placement {
   const { observation, economics } = target;
   const groupId = `${TAG}-p${ctx.serial}-${target.host}`;
-  const noPlan: Placement = {
-    ok: false,
-    code: "PREP_GROUP_TOO_LARGE",
-    requiredUnits: 0,
-  };
+  const noPlan: Placement = { ok: false, requiredUnits: 0 };
   if (!observation || !economics) return noPlan;
   const { moneyPrep, securityPrep } = economics;
 
@@ -1270,7 +1100,7 @@ function planGrowPrep(
 /**
  * Binary-searches the largest size, from 1 to `max`, whose group fits. Waves
  * shrink by whole batches and prep by whole grow/weaken pairs, so whatever
- * fits is complete. When nothing fits, says why a size-1 group doesn't.
+ * fits is complete. When nothing fits, says how much a size-1 group needs.
  */
 function largestThatFits(
   runners: Runner[],
@@ -1302,6 +1132,7 @@ function largestThatFits(
  */
 export function place(runners: Runner[], group: Group): Placement {
   const { jobs } = group;
+  const shortage: Placement = { ok: false, requiredUnits: requiredUnits(jobs) };
   const invalid = jobs.some(
     ({ threads, worker }) =>
       !Number.isFinite(threads) ||
@@ -1309,13 +1140,7 @@ export function place(runners: Runner[], group: Group): Placement {
       !Number.isFinite(worker.ram) ||
       worker.ram <= 0,
   );
-  if (invalid) {
-    return {
-      ok: false,
-      code: "INVALID_PLAN",
-      requiredUnits: requiredUnits(jobs),
-    };
-  }
+  if (invalid) return shortage;
 
   const hosts = runners
     .map((runner) => ({ host: runner.host, units: runner.units }))
@@ -1336,7 +1161,7 @@ export function place(runners: Runner[], group: Group): Placement {
       remaining -= threads;
       if (remaining === 0) break;
     }
-    if (remaining > 0) return shortage(runners, group);
+    if (remaining > 0) return shortage;
     hosts.sort(byPlacementOrder);
   }
 
@@ -1351,32 +1176,6 @@ function withoutFragments(runners: Runner[], fragments: Fragment[]): Runner[] {
       .reduce((sum, fragment) => sum + fragment.units, 0);
     return { ...runner, units: runner.units - placed };
   });
-}
-
-/** Why a group's jobs don't fit on the runners. */
-function shortage(runners: Runner[], group: Group): Placement {
-  const required = requiredUnits(group.jobs);
-  const available = runners.reduce((sum, runner) => sum + runner.units, 0);
-  const blocked = runners.reduce((sum, runner) => sum + runner.blockedUnits, 0);
-  const largest = Math.max(0, ...runners.map((runner) => runner.units));
-  const smallestThread = Math.min(
-    ...group.jobs.map((job) => toUnits(job.worker.ram)),
-  );
-
-  let code: ReasonCode;
-  if (blocked > 0 && available + blocked >= required) {
-    code = "WORKERS_NOT_DEPLOYED";
-  } else if (available < required) {
-    code =
-      group.purpose === "batch"
-        ? "COMPLETE_BATCH_TOO_LARGE"
-        : "PREP_GROUP_TOO_LARGE";
-  } else if (largest < smallestThread) {
-    code = "BELOW_SMALLEST_THREAD";
-  } else {
-    code = "RUNNER_FRAGMENTATION";
-  }
-  return { ok: false, code, requiredUnits: required };
 }
 
 /** Most RAM per thread first, then most threads, earliest delay, then id. */
@@ -1484,8 +1283,6 @@ export function newTarget(host: string): Target {
     settleAfter: 0,
     backoffUntil: 0,
     waitingSince: 0,
-    batchTooLargeCount: 0,
-    batchSizeNotches: 0,
     scheduledBatchCount: 0,
   };
 }
@@ -1543,8 +1340,6 @@ export function markLaunched(target: Target, group: Group): void {
     return;
   }
   target.phase = "BATCH_IN_FLIGHT";
-  target.batchTooLargeCount = 0;
-  target.batchSizeNotches = 0;
   target.scheduledBatchCount += group.batchCount;
 }
 
@@ -1590,40 +1385,23 @@ function batchSizing(hackFraction: number): Config {
   };
 }
 
-/**
- * Expected $/s of repeated waves of this batch, each as many batches as fit
- * in `ram` up to MAX_BATCHES.
- */
-function wavesMoneyPerSecond(batch: Batch, ram: number): number {
-  const fit = Math.floor(ram / batch.ramNeeded);
-  const batches = Math.max(1, Math.min(MAX_BATCHES, fit));
-  const waveMs =
-    LAUNCH_LEAD_MS +
-    batch.weakenTime +
-    (batches - 1) * 4 * LANDING_GAP_MS +
-    3 * LANDING_GAP_MS;
-  return (batch.expectedMoney * batches) / Math.max(0.001, waveMs / 1_000);
+/** How long a batch holds its RAM: from launch to its last landing. */
+function batchHoldMs(batch: Batch): number {
+  return LAUNCH_LEAD_MS + batch.weakenTime + 3 * LANDING_GAP_MS;
 }
 
-/** Running or late: either way it still holds its RAM. */
-function isLive(receipt: Receipt): boolean {
-  return receipt.status === "running" || receipt.status === "late";
+/** Expected $ per GB-second of RAM the batch holds. */
+function moneyPerGbSecond(batch: Batch): number {
+  return batch.expectedMoney / ((batch.ramNeeded * batchHoldMs(batch)) / 1_000);
 }
 
-export function hasLiveReceipts(inFlight: InFlight, host: string): boolean {
-  return inFlight.receipts.some((r) => r.target === host && isLive(r));
+/** Expected $ per GB-second of its batch; 0 if it has none. */
+function scoreOf(target: Target): number {
+  return target.economics?.score ?? 0;
 }
 
-/** What a worker's liveness means, given when it was expected to end. */
-export function workerStatus(
-  receipt: Receipt,
-  running: boolean,
-  now: number,
-): Receipt["status"] {
-  if (running) {
-    return now > receipt.endsAt + LATE_TOLERANCE_MS ? "late" : "running";
-  }
-  return now >= receipt.endsAt - EARLY_TOLERANCE_MS ? "finished" : "lost";
+export function hasWorkersInFlight(inFlight: Receipt[], host: string): boolean {
+  return inFlight.some((receipt) => receipt.target === host);
 }
 
 export function requiredUnits(jobs: Job[]): number {
@@ -1652,8 +1430,9 @@ function renderStatus(ns: NS, state: State, decision: Decision): void {
   ns.clearLog();
 
   const free = fromUnits(state.runners.reduce((sum, r) => sum + r.units, 0));
-  const live = state.inFlight.receipts.filter(isLive);
-  const inFlightRam = fromUnits(live.reduce((sum, r) => sum + r.units, 0));
+  const inFlightRam = fromUnits(
+    state.inFlight.reduce((sum, r) => sum + r.units, 0),
+  );
   const uptime = formatDuration(Date.now() - state.startedAt);
 
   const lines = [
@@ -1663,10 +1442,11 @@ function renderStatus(ns: NS, state: State, decision: Decision): void {
     `Network: ${state.hosts.length} known | ${state.runners.length} runners | ` +
       `rooted +${state.rooted} | deployed +${state.deployed}`,
     `RAM: ${formatRam(state.capacityRam)} usable | ` +
-      `${formatRam(free)} schedulable | ${formatRam(inFlightRam)} in flight | ` +
+      `${formatRam(free)} free | ${formatRam(inFlightRam)} in flight | ` +
       `${formatRam(state.settings.homeReserve)} home reserve`,
+    `Batches steal ${(state.hackFraction * 100).toFixed(0)}% of a server's money`,
     `Last launch: ${state.lastLaunch}`,
-    ...targetLines(ns, state),
+    ...targetLines(state),
     ...inFlightLines(state),
     ...decisionLines(decision, free),
   ];
@@ -1676,14 +1456,13 @@ function renderStatus(ns: NS, state: State, decision: Decision): void {
   ns.print(lines.join("\n"));
 }
 
-function targetLines(ns: NS, state: State): string[] {
-  const lines = [`--- targets (${state.targets.size}) ---`];
-  const byRate = [...state.targets.values()].sort(
-    (a, b) =>
-      (b.economics?.moneyPerSecond ?? 0) - (a.economics?.moneyPerSecond ?? 0),
+function targetLines(state: State): string[] {
+  const lines = [`--- targets (${state.targets.size}), best first ---`];
+  const byScore = [...state.targets.values()].sort(
+    (a, b) => scoreOf(b) - scoreOf(a) || compareText(a.host, b.host),
   );
 
-  for (const { host, phase, observation, economics } of byRate) {
+  for (const { host, phase, observation } of byScore) {
     const money =
       observation && observation.maxMoney > 0
         ? `${((observation.money / observation.maxMoney) * 100).toFixed(0)}%`
@@ -1691,18 +1470,16 @@ function targetLines(ns: NS, state: State): string[] {
     const security = observation
       ? `${observation.security.toFixed(1)}/${observation.minSecurity.toFixed(1)}`
       : "-";
-    const rate = ns.format.number(economics?.moneyPerSecond ?? 0);
     lines.push(
-      `  ${host.padEnd(18)} ${phase.padEnd(19)} money ${money.padStart(4)} | ` +
-        `sec ${security.padStart(11)} | $${rate}/s`,
+      `  ${host.padEnd(18)} ${PHASES[phase].padEnd(12)} money ${money.padStart(4)} | ` +
+        `sec ${security.padStart(11)}`,
     );
   }
   return lines;
 }
 
 function inFlightLines(state: State): string[] {
-  const live = state.inFlight.receipts.filter(isLive);
-  if (live.length === 0 && state.previousWorkers.length === 0) {
+  if (state.inFlight.length === 0 && state.previousWorkers.length === 0) {
     return ["--- in flight: none ---"];
   }
 
@@ -1713,7 +1490,7 @@ function inFlightLines(state: State): string[] {
     endsAt: number;
   };
   const groups = new Map<string, Summary>();
-  for (const { groupId, target, units, endsAt } of live) {
+  for (const { groupId, target, units, endsAt } of state.inFlight) {
     const group = groups.get(groupId) ?? { target, count: 0, units: 0, endsAt };
     group.count++;
     group.units += units;
@@ -1723,17 +1500,14 @@ function inFlightLines(state: State): string[] {
 
   const now = Date.now();
   const lines = [
-    `--- in flight: ${groups.size} group(s), ${live.length} fragment(s) ---`,
+    `--- in flight: ${groups.size} group(s), ${state.inFlight.length} fragment(s) ---`,
   ];
   for (const [id, group] of groups) {
-    const faults = state.inFlight.faults.get(id);
     lines.push(
       `  ${id.padEnd(26)} ${group.target.padEnd(16)} ` +
         `${String(group.count).padStart(3)} frag | ` +
         `${formatRam(fromUnits(group.units)).padStart(10)} | ` +
-        `ends in ${formatDuration(Math.max(0, group.endsAt - now))}` +
-        (faults?.late ? ` | ${faults.late} LATE` : "") +
-        (faults?.lost ? ` | ${faults.lost} LOST` : ""),
+        `ends in ${formatDuration(Math.max(0, group.endsAt - now))}`,
     );
   }
 
@@ -1745,26 +1519,13 @@ function inFlightLines(state: State): string[] {
 }
 
 function decisionLines(decision: Decision, freeRam: number): string[] {
-  if (decision.kind !== "idle") {
-    return [
-      `--- decision: ${describeGroup(decision.group)} ---`,
-      ...fragmentLines(decision.fragments),
-    ];
+  if (decision.kind === "idle") {
+    return [`--- idle: ${formatRam(freeRam)} free ---`];
   }
-
-  const unallocated = formatRam(freeRam);
-  const lines = [
-    `--- idle: ${unallocated} unallocated (${decision.dominantReason}) ---`,
+  return [
+    `--- decision: ${describeGroup(decision.group)} ---`,
+    ...fragmentLines(decision.fragments),
   ];
-  const hostsByCode = new Map<ReasonCode, string[]>();
-  for (const { host, code } of decision.reasons) {
-    hostsByCode.set(code, [...(hostsByCode.get(code) ?? []), host]);
-  }
-  for (const [code, hosts] of hostsByCode) {
-    const more = hosts.length > 4 ? ` +${hosts.length - 4} more` : "";
-    lines.push(`  ${code.padEnd(26)} ${hosts.slice(0, 4).join(", ")}${more}`);
-  }
-  return lines;
 }
 
 /** One line per server a group was placed on. */
