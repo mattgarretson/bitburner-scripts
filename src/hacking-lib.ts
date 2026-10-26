@@ -1,6 +1,6 @@
 /**
- * Shared Netscript helpers: network scan/root/deploy, worker costs, target
- * inspection, and the prepared-batch model used to size and rank targets.
+ * Shared Netscript helpers: network scan/root/deploy, worker costs, and the
+ * prepared-batch model used to size batches and rank targets.
  */
 
 export const WORKER_FILES = {
@@ -23,38 +23,14 @@ export type Workers = {
   weaken: WorkerFile;
 };
 
+/** How buildPreparedBatch sizes a batch. */
 export type Config = {
   hackFraction: number;
   minimumHackFraction: number;
-  homeReserve: number;
-  landingGap: number;
-  maxBatches: number;
-  launchLead: number;
   growSafetyMargin?: number;
 };
 
-export type UnknownTarget = {
-  host: string;
-  valid: false;
-  reason: string;
-};
-
-export type ReadyTarget = {
-  host: string;
-  valid: true;
-  money: number;
-  maxMoney: number;
-  security: number;
-  minSecurity: number;
-  requiredLevel: number;
-  hackTime: number;
-  growTime: number;
-  weakenTime: number;
-};
-
-export type TargetInfo = UnknownTarget | ReadyTarget;
-
-export type PreparedMetrics = {
+type PreparedMetrics = {
   maxMoney: number;
   minSecurity: number;
   hackPercent: number;
@@ -65,11 +41,6 @@ export type PreparedMetrics = {
 };
 
 export type Batch = {
-  host: string;
-  maxMoney: number;
-  hackChance: number;
-  hackPercent: number;
-  actualFraction: number;
   expectedMoney: number;
   hackThreads: number;
   growThreads: number;
@@ -79,16 +50,6 @@ export type Batch = {
   hackTime: number;
   growTime: number;
   weakenTime: number;
-};
-
-export type RankingRow = {
-  host: string;
-  score: number;
-  expectedPerSecond: number;
-  expectedPerWave: number;
-  batches: number;
-  waveMs: number;
-  batch: Batch;
 };
 
 export function loadWorkers(ns: NS): Workers | null {
@@ -195,91 +156,6 @@ export function deployWorkers(
   return copied;
 }
 
-export function inspectTarget(ns: NS, host: string): TargetInfo {
-  if (!host || !ns.serverExists(host)) {
-    return { host, valid: false, reason: `Unknown target: ${host}` };
-  }
-
-  const server = ns.getServer(host);
-  const maxMoney = server.moneyMax ?? 0;
-  const requiredLevel = server.requiredHackingSkill ?? Infinity;
-
-  if (server.purchasedByPlayer || maxMoney <= 0) {
-    return { host, valid: false, reason: `${host} is not a money server` };
-  }
-  if (!ns.hasRootAccess(host)) {
-    return { host, valid: false, reason: `No root access on ${host}` };
-  }
-  if (requiredLevel > ns.getHackingLevel()) {
-    return {
-      host,
-      valid: false,
-      reason: `${host} requires hacking level ${requiredLevel}`,
-    };
-  }
-
-  return {
-    host,
-    valid: true,
-    money: server.moneyAvailable ?? 0,
-    maxMoney,
-    security: server.hackDifficulty ?? 100,
-    minSecurity: server.minDifficulty ?? 100,
-    requiredLevel,
-    hackTime: ns.getHackTime(host),
-    growTime: ns.getGrowTime(host),
-    weakenTime: ns.getWeakenTime(host),
-  };
-}
-
-/**
- * Rank targets by the expected dollars/second this manager can produce with
- * its current RAM, configured batch count, gap, and maximum hack fraction.
- *
- * This pays for the grow and both weakens, not just the hack.
- */
-export function rankTargets(
-  ns: NS,
-  hosts: string[],
-  workers: Workers,
-  config: Config,
-  availableRam: number,
-): RankingRow[] {
-  const rows: RankingRow[] = [];
-
-  for (const host of hosts) {
-    if (!isHackableMoneyServer(ns, host)) continue;
-
-    const batch = buildPreparedBatch(ns, host, workers, config, availableRam);
-    if (!batch) continue;
-
-    const batches = Math.max(
-      1,
-      Math.min(config.maxBatches, Math.floor(availableRam / batch.ramNeeded)),
-    );
-    const waveMs =
-      config.launchLead +
-      batch.weakenTime +
-      (batches - 1) * 4 * config.landingGap +
-      3 * config.landingGap;
-    const expectedPerWave = batch.expectedMoney * batches;
-    const expectedPerSecond = expectedPerWave / Math.max(0.001, waveMs / 1_000);
-
-    rows.push({
-      host,
-      score: expectedPerSecond,
-      expectedPerSecond,
-      expectedPerWave,
-      batches,
-      waveMs,
-      batch,
-    });
-  }
-
-  rows.sort((a, b) => b.score - a.score || b.batch.maxMoney - a.batch.maxMoney);
-  return rows;
-}
-
 /**
  * Build a complete batch for a hypothetical prepared target. The requested
  * hack fraction is reduced only when the current network cannot fit one batch.
@@ -326,11 +202,6 @@ export function buildPreparedBatch(
     if (ramNeeded > availableRam + 1e-9) continue;
 
     return {
-      host,
-      maxMoney: metrics.maxMoney,
-      hackChance: metrics.hackChance,
-      hackPercent: metrics.hackPercent,
-      actualFraction,
       expectedMoney: metrics.maxMoney * actualFraction * metrics.hackChance,
       hackThreads,
       growThreads,
@@ -421,14 +292,14 @@ function adjustedGrowthLog(security: number): number {
   );
 }
 
-export function weakenThreadsForHack(ns: NS, hackThreads: number): number {
+function weakenThreadsForHack(ns: NS, hackThreads: number): number {
   return Math.max(
     1,
     Math.ceil(ns.hackAnalyzeSecurity(hackThreads) / ns.weakenAnalyze(1, 1)),
   );
 }
 
-export function weakenThreadsForGrow(ns: NS, growThreads: number): number {
+function weakenThreadsForGrow(ns: NS, growThreads: number): number {
   // No hostname: a hostname can cap this against the target's current money,
   // which is wrong when planning growth that occurs after a future hack.
   return Math.max(
@@ -440,21 +311,8 @@ export function weakenThreadsForGrow(ns: NS, growThreads: number): number {
   );
 }
 
-export function formatRam(gb: number): string {
-  if (gb >= 1_024) return `${(gb / 1_024).toFixed(2)} TB`;
-  return `${gb.toFixed(1)} GB`;
-}
-
-function isHackableMoneyServer(ns: NS, host: string): boolean {
-  if (!host || !ns.serverExists(host) || !ns.hasRootAccess(host)) return false;
-
-  const server = ns.getServer(host);
-  if (server.purchasedByPlayer || (server.moneyMax ?? 0) <= 0) return false;
-  return (server.requiredHackingSkill ?? Infinity) <= ns.getHackingLevel();
-}
-
-/** Shared by every script that reads a numeric flag; non-finite input floors. */
-export function clamp(value: number, minimum: number, maximum: number): number {
+/** Non-finite input gives the minimum. */
+function clamp(value: number, minimum: number, maximum: number): number {
   if (!Number.isFinite(value)) return minimum;
   return Math.min(maximum, Math.max(minimum, value));
 }
