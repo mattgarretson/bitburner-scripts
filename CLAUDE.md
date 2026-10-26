@@ -1,204 +1,91 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Netscript scripts for **Bitburner 3.0.2**, in **TypeScript**. There is no build step:
+`bitburner-filesync` (`npm run sync`) pushes `src/` verbatim to the in-game `home` server
+and the game transpiles it, so what you edit is what runs. `tsc` is only a type check.
 
-## What this is
-
-Netscript automation scripts for **Bitburner 3.0.2**, written in **TypeScript**. There is
-no build step: `.ts` files in `src/` are pushed verbatim to the in-game `home` server by
-`bitburner-filesync` over the Remote File API (port 12525, `filesync.json`), and Bitburner
-transpiles them itself. What you edit is what runs in the game — `tsc` is only ever used
-for `--noEmit` type checking.
-
-Claude cannot run Bitburner. Never claim in-game/integration behavior was tested — only
-Node tests, type checking, and reading code are actually verifiable here.
+Claude can't run Bitburner. Never claim anything was tested in-game: Node tests, type
+checks and reading code are what can be verified here. `sim/` (gitignored, this machine
+only) simulates hacking with the game's formulas; `sim/README.md` explains it. Report its
+results as simulated.
 
 ## Commands
 
 ```
-npm run sync          # start bitburner-filesync; pushes src/ to home while the game is connected
-npm test              # node --test
-npm run check         # tsc --noEmit
-npm run format        # prettier --write src/ tests/
-npm run format:check
+npm test                                   # node --test
+npm run check                              # tsc --noEmit
+npm run format                             # prettier on src/ and tests/*.{js,ts}
+node --test tests/<name>.test.mjs
+node --test --test-name-pattern "<regex>"
 ```
 
-Single test file: `node --test tests/<name>.test.mjs`. Single test by name:
-`node --test --test-name-pattern "<regex>"`.
+Both `npm test` and `npm run check` must stay green. Tests are `.mjs` files that import
+the `.ts` sources directly (Node strips the types) and hand `ns`-using functions a small
+fake `ns`. They aren't type-checked, and the format script doesn't match them: run
+`npx prettier --write tests/<file>.mjs`.
 
-**Both `npm test` and `npm run check` are green and must stay that way.** As of the last
-sweep: 95 tests passing across `tests/hacking-lib.test.mjs`,
-`tests/multi-planning.test.mjs`, `tests/multi-scheduler.test.mjs`, and
-`tests/multi-runtime.test.mjs`, and zero `tsc` errors under `"strict": true`.
+## Netscript traps
 
-Tests are plain `.mjs` importing the `.ts` sources directly — Node's type-stripping runs
-them without a build step, which is why the pure modules must stay free of any `ns` import.
-`tsconfig.json` includes `tests/**`, so test files are type-checked too.
-
-## Netscript constraints that shape the code
-
-- Every runnable script exports `export async function main(ns: NS)`. Imports must be
-  relative with an explicit `.ts` extension (`from "./hacking-lib.ts"`) — the game resolves
-  these as literal file paths on `home`, so path/extension changes break running scripts.
-  Do **not** let an editor or tool rewrite these to extensionless or `.js` specifiers.
-  `allowImportingTsExtensions` in `tsconfig.json` is what keeps `tsc` happy with this.
-- Script RAM cost is charged for every `ns.*` API *referenced* in a file, whether called or
-  not. This is why `worker-hack.ts` / `worker-grow.ts` / `worker-weaken.ts` are ~400-byte
-  files that touch exactly one API each: adding any other `ns` call to a worker multiplies
-  the RAM cost of every thread the manager launches.
-- `types/NetScriptDefinitions.d.ts` is **generated** — filesync overwrites it from the
-  running game (`definitionFile.update: true`). Never hand-edit it. `types/globals.d.ts`
-  is the small hand-written file that exposes `NS` as an ambient global type, which is why
-  sources annotate `ns: NS` without importing anything.
-- Types are erased, not checked, at runtime: Bitburner strips them, and so does Node when
-  the `.mjs` tests import a `.ts` module. Never rely on a type for a runtime guarantee, and
-  keep type-only imports under `import type { ... }` so nothing extra is pulled in.
-- Bitburner 3.x moved purchased-server APIs under `ns.cloud.*` and formatting under
-  `ns.format.*`. Older Netscript snippets found online will use the pre-3.x names.
+- Imports are relative with an explicit `.ts` extension (`from "./hacking-lib.ts"`): the
+  game resolves them as literal paths on `home`. Never let a tool rewrite them.
+- A script's RAM cost counts every `ns` function the file references, called or not. The
+  workers (`worker-hack.ts`, `worker-grow.ts`, `worker-weaken.ts`) reference one each, and
+  every thread the managers launch pays for them: **never modify the workers.**
+- `types/NetScriptDefinitions.d.ts` is generated from the running game by filesync: never
+  hand-edit it. `types/globals.d.ts` makes `NS` a global type.
+- Types are erased at runtime, in the game and in the tests: never rely on one for a
+  runtime guarantee, and keep type-only imports under `import type`.
+- Bitburner 3.x moved purchased servers to `ns.cloud.*` and formatting to `ns.format.*`;
+  snippets found online use the older names.
+- Scripts in `src/singularity/` import `../hacking-lib.ts`, so script names they pass to
+  Netscript must include the folder.
+- `src/README.txt` is the in-game quick reference: keep it in sync with flags and usage.
 
 ## Code style
 
-Write for a person reading the file top to bottom. Prettier owns layout
-(`npm run format`); these rules are about structure. `src/singularity/workout.ts` is the
-reference example of a small script written this way.
+Write for someone reading top to bottom; Prettier owns layout.
+`src/singularity/workout.ts` is the reference example.
 
-- **`main` reads like a description of the script.** Keep it to the high-level steps and
-  move each step into a small named function declared below it. Nested loops, inline state
-  checks, or a tracking flag in `main` usually mean a helper is missing.
-- **Names say what the thing means.** `CONSTANT_CASE` module constants, `UpperCamelCase`
-  types, `lowerCamelCase` functions. Predicates read as questions (`isWorkingOut`), actions
-  as verbs (`startWorkout`).
-- **Named functions are function declarations**, not arrow-function constants, with
-  explicit parameter and return types.
-- **Guard clauses over nesting:** `if (done) continue;` or an early `return` first, then
-  the main path unindented.
-- **Comments:** a short `/** JSDoc */` on a helper saying what it does; `//` only for *why*
-  a line exists (a game quirk, a non-obvious ordering). Don't narrate what the code already
-  says. Every script keeps the header block used across `src/`: `path — one-line summary`,
-  behaviour notes, `Usage: run ...`, `@param {NS} ns`.
-- **New scripts take their tunables as constants at the top of the file**, not as flags or
-  arguments.
-- **Lookup tables are `as const` arrays or objects**, with types derived from them
-  (`type Stat = (typeof STATS)[number]`) rather than a hand-written union kept in sync.
-  Plain string literals are fine for game names — `tsc` checks them against the generated
-  definitions.
-- **Failures in runnable scripts go to the terminal, not exceptions.** Print the problem
-  with `ns.tprint` and end the script; do not `throw` for an expected failure. When the
-  failure is detected below `main`, use a small `fail(ns, message): never` helper
-  (`ns.tprint` then `ns.exit()`, which costs 0 GB) instead of passing `false` back up
-  through every caller. Pure modules are different: they return structured results
-  (`ok: false` plus a reason), as described under Plan-then-launch.
+- `main` reads like a description of the script: high-level steps, each a small named
+  function declared below it.
+- Names say what things mean: `CONSTANT_CASE` constants, `UpperCamelCase` types,
+  `lowerCamelCase` functions. Predicates read as questions, actions as verbs.
+- Named functions are function declarations with explicit parameter and return types.
+- Guard clauses (`continue`, early `return`) instead of nesting.
+- A short `/** JSDoc */` on each helper saying what it does; `//` only for why (a game
+  quirk, a non-obvious ordering), never narrating the code. Every script keeps the header
+  block: `path — summary`, behaviour notes, `Usage: run ...`, `@param {NS} ns`.
+- Tunables are constants at the top of the file; add a flag only when the user asks.
+- Lookup tables are `as const`, with types derived from them.
+- Expected failures go to the terminal: `ns.tprint`, then end the script (from below
+  `main`, a `fail(ns, message): never` helper), never `throw`. Pure functions return
+  `ok: false` plus a reason instead.
 
-## Architecture
+## Hacking managers
 
-### batcher.ts (on trial as the replacement)
+`batcher.ts` is a deliberately simple single-file batcher, on trial against
+`multi-manager.ts`. Keep it small: constants only, no flags, no tests. The rules below
+don't apply to it.
 
-`batcher.ts` is a deliberately simple, single-file batcher written because the user finds
-the multi-manager suite below far too large to read. It preps each target, then keeps a
-continuous stream of HWGW batches landing on it, launching only while the target reads
-prepped (so each batch's durations are read at minimum security). A target that drifts gets
-no new batches until its last one lands, then is prepped again. Per-target state is just
-the last landing time. Tunables are constants at the top; there are no flags and no tests.
-Keep it that way: none of the scheduler rules below apply to it, and changes should stay
-small. If the user's income comparison (`hack-income.ts`) favours it, the plan is to delete
-the three `multi-*` modules, their tests and both design docs, and trim this file to match.
+`multi-manager.ts` is the multi-target scheduler (`--hack`, `--targets`, `--reserve`);
+`hacking-lib.ts` holds what other scripts share with it. `docs/` describes an older
+design: treat it as history. Rules:
 
-### Module split
+- Plan, then launch: a group is placed on a copy of the runners' free RAM and launched
+  all or nothing; if any `ns.exec` fails, the PIDs already started are killed.
+- A batch is H + W1 + G + W2. Waves shrink by whole batches only; never drop an operation
+  or a compensating weaken. Money prep is always grow plus its weaken.
+- Never plan from predicted state or an older reading: every group is planned from a
+  reading taken in the loop it launches in, because each hacking level shortens every
+  operation and older timings land out of order.
+- Batches come before prep: prep only gets RAM no batch can use, and never delays a batch
+  window that is known to be coming.
+- `--reserve` comes off home's RAM everywhere RAM is measured or used.
+- A second running copy prints an error and launches nothing; it never kills the other.
+- Planning and scheduling logic needs Node tests in `tests/multi-manager.test.mjs`.
+- `hacking-lib.ts`'s batch model has deliberate quirks (such as no hostname on
+  `growthAnalyzeSecurity`): read its comments before "fixing" anything.
 
-`multi-manager.ts` is the multi-target HGW scheduler. It is
-kept as a readable event loop: refresh infrastructure → reconcile receipts → observe
-quiescent targets → snapshot runners → ask for one decision → commit it → render → sleep.
-It contains no allocation math. The work is split across:
-
-- `multi-runtime.ts` — every `ns` read, exec, kill and PID poll for the scheduler.
-- `multi-planning.ts` — pure job timing, RAM allocation, and in-flight receipt accounting.
-- `multi-scheduler.ts` — pure per-target reducer and the `decide()` policy.
-- `hacking-lib.ts` — shared `ns` helpers: network scan/root/deploy, worker costs, target
-  inspection, and the prepared-batch model (`buildPreparedBatch`, `rankTargets`).
-
-Keep the purity boundary: `multi-planning.ts` and `multi-scheduler.ts` must contain no `ns`
-access, which is what lets the Node tests import them directly.
-
-### The worker contract
-
-All three workers take the same positional args and perform exactly one operation:
-
-```
-[target, requestedDelay, plannedAt, groupOrBatchId, label]
-```
-
-Each worker subtracts launch skew (`Date.now() - plannedAt`) from `requestedDelay` and
-passes the remainder as `additionalMsec`, so a slow `ns.exec` sequence doesn't smear the
-H/W/G/W landing order. Arg 3 carries the scheduler's `mm-` group tag, which is how
-`recoverTaggedProcesses()` finds its own workers after a restart.
-
-### Plan-then-launch
-
-Nothing is executed until a whole logical unit is allocated. `allocateJobs()` in
-`multi-planning.ts` allocates against a **private copy of the RAM ledger**, so `ok: true`
-means every thread of every job has a home; `ok: false` carries a structured rejection and
-nothing was touched. `commitGroup()` in `multi-runtime.ts` re-checks live RAM and target
-state, execs in delay order, and kills every already-launched PID if any `ns.exec` returns
-0. Wave and prep sizing (`planLargestWave`, `planLargestMoneyPrep`,
-`planLargestSecurityPrep`) binary-search the largest size that allocates.
-
-A wave is only ever shrunk by whole batches. A batch is H + W1 + G + W2; never drop an
-operation or a compensating weaken to make something fit. Money prep is always grow plus
-its weaken.
-
-`config.homeReserve` is subtracted from `home`'s RAM in `snapshotRunners()` before any
-planning, so it must not be circumvented anywhere.
-
-### Batch model details worth knowing before editing `hacking-lib.ts`
-
-- `getPreparedMetrics()` extrapolates hack percent/chance and H/G/W durations from the
-  target's *current* security to its *minimum* security, because targets are batched only
-  once prepared. `growthThreadsAtSecurity()` similarly rescales `ns.growthAnalyze()` (which
-  answers for current security) using the game's adjusted growth log constants.
-- `weakenThreadsForGrow()` deliberately omits the hostname argument to
-  `ns.growthAnalyzeSecurity` — passing it caps the result against the target's *current*
-  money, which is wrong when planning growth that happens after a future hack.
-- `rankTargets()` scores expected dollars/second under a real four-operation batch, priced
-  against the given RAM — not a generic max-money/weaken-time heuristic.
-
-## Scheduler rules
-
-These apply to `multi-manager.ts` and its modules only, not to `batcher.ts`.
-
-`docs/multi-target-design.md` is the accepted design for the scheduler.
-`docs/scheduler-improvement-plan.md` is the ordered work list against it —
-dependency-ordered, so do its items in order. Both predate the removal of the old
-single-target `manager.ts`; ignore their references to it.
-
-- **Do not modify the workers** — see the RAM-cost note above.
-- `multi-manager.ts` must detect a second running copy of itself, report
-  `CONFLICTING_MANAGER`, and launch nothing. It must never kill the other copy.
-- Never schedule from predicted state. A target returns to `NEEDS_OBSERVATION` after any
-  group ends; generation tokens invalidate plans built from a stale observation.
-- Complete profitable batches are considered before prep; prep may only use RAM the batch
-  pass left idle, and never delays a batch window that is already known to be ready.
-- Every unallocated chunk of usable RAM needs a structured, displayable reason (see the
-  idle reason-code table in the design doc).
-- Pure planning/scheduling logic must have Node tests. Timing, PID lifecycle, SCP behavior,
-  and real hack/grow/weaken effects can only be validated manually in-game.
-
-## Other scripts
-
-`cloud-manager.ts` (buys/upgrades `ns.cloud` servers by lowest
-$/GB until all are at the ceiling, then exits),
-`xp-farm.ts` / `xp-grow.ts` (grow loop for hacking XP), `path.ts`
-(connect path to a host), `stop-hacking.ts` (kills either manager and all
-workers network-wide — run before replacing the suite), `hack-income.ts` (measures
-hacking $/s over 10 minutes, to compare the two managers).
-
-`src/singularity/` holds Singularity-API scripts (`buy-programs.ts`, `backdoor.ts`);
-they import shared code as `../hacking-lib.ts`, so any script name they pass to
-Netscript must include the folder.
-
-`src/gang/` holds gang scripts: `manager.ts` runs a combat gang end to end (recruit,
-train until a task actually pays, ascend, buy equipment, work, and switch members to
-Territory Warfare only for the update that holds the 20 s power tick, which it detects
-from other gangs' power changing); `set-activity.ts` sets every member's task by hand.
-
-`src/README.txt` is the in-game user-facing quick reference and ships to `home` with the
-scripts; keep it in sync when flags or usage change.
+Workers take `[target, requestedDelay, plannedAt, groupOrBatchId, label]`, subtract launch
+skew (`Date.now() - plannedAt`) from the delay, and pass the rest as `additionalMsec`.
+Group ids start with `mm-`, which is how a restarted manager finds its own workers.
