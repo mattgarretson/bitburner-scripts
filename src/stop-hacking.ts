@@ -8,7 +8,6 @@ export async function main(ns: NS): Promise<void> {
   const scripts = [
     "early-hack.ts",
     "multi-manager.ts",
-    "batcher.ts",
     "worker-hack.ts",
     "worker-grow.ts",
     "worker-weaken.ts",
