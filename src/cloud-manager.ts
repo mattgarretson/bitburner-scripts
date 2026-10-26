@@ -45,28 +45,20 @@ export async function main(ns: NS): Promise<void> {
   const yolo = Boolean(ns.flags([["yolo", false]]).yolo);
   if (yolo) ns.print("--yolo: no spend cap, no cash reserve");
 
-  const ceiling = ns.cloud.getRamLimit();
   let lastWaiting = "";
 
   while (true) {
-    const servers = ns.cloud.getServerNames();
-    const slotsLeft = ns.cloud.getServerLimit() - servers.length;
-
-    if (
-      slotsLeft <= 0 &&
-      servers.every((host) => ns.getServerMaxRam(host) >= ceiling)
-    ) {
+    const step = nextStep(ns);
+    if (!step) {
       ns.tprint(
-        `cloud-manager: all ${servers.length} servers are at ` +
-          `${ns.format.ram(ceiling)}. Nothing left to buy.`,
+        `cloud-manager: all ${ns.cloud.getServerNames().length} servers are ` +
+          `at ${ns.format.ram(ns.cloud.getRamLimit())}. Nothing left to buy.`,
       );
       return;
     }
 
     const cash = ns.getServerMoneyAvailable("home");
     const budget = spendingBudget(cash, yolo);
-
-    const step = levelingStep(ns, servers, slotsLeft);
 
     if (step.cost > budget) {
       const waiting = `${step.label} costs $${ns.format.number(step.cost)}`;
@@ -81,7 +73,8 @@ export async function main(ns: NS): Promise<void> {
     lastWaiting = "";
     if (step.act()) {
       ns.print(
-        `${step.label} | $${ns.format.number(step.cost)} | ` +
+        `${new Date().toLocaleTimeString()} | ` +
+          `${step.label} | $${ns.format.number(step.cost)} | ` +
           `$${ns.format.number(step.cost / step.addedRam)}/GB`,
       );
       await ns.sleep(100);
@@ -99,11 +92,15 @@ function spendingBudget(cash: number, yolo: boolean): number {
 }
 
 /**
- * The one step that keeps the fleet level: fill an empty slot with a MIN_RAM
- * server, or with every slot taken, double the smallest server.
+ * The one purchase that keeps the fleet level: fill an empty slot with a
+ * MIN_RAM server, or with every slot taken, double the smallest server. Null
+ * once every slot is at the RAM limit. cloud-step.ts shares this, so the two
+ * scripts always agree on what comes next.
  */
-function levelingStep(ns: NS, servers: string[], slotsLeft: number): Step {
-  if (slotsLeft > 0) {
+export function nextStep(ns: NS): Step | null {
+  const servers = ns.cloud.getServerNames();
+
+  if (servers.length < ns.cloud.getServerLimit()) {
     const name = nextName(servers);
     return {
       label: `buy ${name} at ${ns.format.ram(MIN_RAM)}`,
@@ -112,8 +109,11 @@ function levelingStep(ns: NS, servers: string[], slotsLeft: number): Step {
       act: () => ns.cloud.purchaseServer(name, MIN_RAM) !== "",
     };
   }
+  if (servers.length === 0) return null;
 
   const { host, ram } = smallestServer(ns, servers);
+  if (ram >= ns.cloud.getRamLimit()) return null;
+
   return {
     label: `upgrade ${host}: ${ns.format.ram(ram)} -> ${ns.format.ram(ram * 2)}`,
     cost: ns.cloud.getServerUpgradeCost(host, ram * 2),
