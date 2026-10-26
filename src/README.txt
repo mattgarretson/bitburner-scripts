@@ -11,6 +11,8 @@ WATCH IT
   tail multi-manager.ts            if it was started with no options; otherwise repeat them
   ps                               lists PIDs; "tail <PID>" works without the options
   run multi-manager.ts --tail      opens the log window as it starts
+  The window shows hacking $/s, game lag, the plan, and per target what it's doing, its RAM, and when it starts paying.
+  Game lag near 200 ms (the gap between landings) can make batches land out of order.
 
 MULTI-MANAGER OPTIONS
   --reserve 8      GB kept free on home

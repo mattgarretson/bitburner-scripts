@@ -28,11 +28,17 @@ export type Config = {
   hackFraction: number;
   minimumHackFraction: number;
   growSafetyMargin?: number;
+  /**
+   * Hacking levels you are gaining per millisecond. Each level makes a hack
+   * steal a little more, so grow is sized for your level when the hack lands.
+   */
+  levelsPerMs?: number;
 };
 
 type PreparedMetrics = {
   maxMoney: number;
   minSecurity: number;
+  requiredLevel: number;
   hackPercent: number;
   hackChance: number;
   hackTime: number;
@@ -170,6 +176,7 @@ export function buildPreparedBatch(
   const metrics = getPreparedMetrics(ns, host);
   if (!metrics || metrics.hackPercent <= 0 || metrics.hackChance <= 0)
     return null;
+  const drift = hackDrift(ns, metrics, config.levelsPerMs ?? 0);
 
   for (
     let requestedFraction = config.hackFraction;
@@ -186,7 +193,9 @@ export function buildPreparedBatch(
     // draining nearly the entire server makes batching unstable and expensive.
     if (actualFraction <= 0 || actualFraction >= 0.9) continue;
 
-    const growMultiplier = 1 / (1 - actualFraction);
+    // Grow must refill what the hack takes at the level it lands with.
+    const landingFraction = Math.min(0.95, actualFraction * drift);
+    const growMultiplier = 1 / (1 - landingFraction);
     const growThreads = applyGrowSafetyMargin(
       growthThreadsAtSecurity(ns, host, growMultiplier, metrics.minSecurity),
       config.growSafetyMargin ?? 0,
@@ -217,6 +226,25 @@ export function buildPreparedBatch(
   return null;
 }
 
+/**
+ * How much more a hack steals by the time it lands, a weaken time from now,
+ * at `levelsPerMs`: what a thread steals scales with (level - required + 1) /
+ * level.
+ */
+function hackDrift(
+  ns: NS,
+  metrics: PreparedMetrics,
+  levelsPerMs: number,
+): number {
+  // Types are erased at runtime, so anything but a real rate means no drift.
+  if (!(Number.isFinite(levelsPerMs) && levelsPerMs > 0)) return 1;
+  const level = ns.getHackingLevel();
+  const landingLevel = level + levelsPerMs * metrics.weakenTime;
+  const factor = (at: number): number => (at - metrics.requiredLevel + 1) / at;
+  const drift = factor(landingLevel) / factor(level);
+  return Number.isFinite(drift) && drift > 1 ? drift : 1;
+}
+
 export function applyGrowSafetyMargin(threads: number, margin: number): number {
   if (!Number.isFinite(threads)) return threads;
   return Math.max(1, Math.ceil(threads * (1 + Math.max(0, margin))));
@@ -245,11 +273,9 @@ function getPreparedMetrics(ns: NS, host: string): PreparedMetrics | null {
   const minSecurity = server.minDifficulty ?? currentSecurity;
   const requiredLevel = server.requiredHackingSkill;
 
-  if (maxMoney <= 0 || currentSecurity >= 100 || minSecurity <= 0) return null;
-
-  // hack percent and chance are linear in (100 - security).
-  const successScale =
-    (100 - minSecurity) / Math.max(0.000001, 100 - currentSecurity);
+  if (maxMoney <= 0 || minSecurity <= 0) return null;
+  const odds = oddsAtMinimumSecurity(ns, host, server);
+  if (!odds) return null;
 
   // H/G/W time shares the same affine difficulty factor.
   const timeScale = hackTimeScale(requiredLevel, currentSecurity, minSecurity);
@@ -257,11 +283,41 @@ function getPreparedMetrics(ns: NS, host: string): PreparedMetrics | null {
   return {
     maxMoney,
     minSecurity,
-    hackPercent: clamp(ns.hackAnalyze(host) * successScale, 0, 1),
-    hackChance: clamp(ns.hackAnalyzeChance(host) * successScale, 0, 1),
+    requiredLevel: requiredLevel ?? 1,
+    hackPercent: clamp(odds.percent, 0, 1),
+    hackChance: clamp(odds.chance, 0, 1),
     hackTime: ns.getHackTime(host) * timeScale,
     growTime: ns.getGrowTime(host) * timeScale,
     weakenTime: ns.getWeakenTime(host) * timeScale,
+  };
+}
+
+/**
+ * Hack percent and chance once the server is at minimum security. Both are
+ * linear in (100 - security), so the live answers scale down to the minimum.
+ * At 100 security they read 0, and only Formulas.exe can answer, if you have it.
+ */
+function oddsAtMinimumSecurity(
+  ns: NS,
+  host: string,
+  server: ReturnType<NS["getServer"]>,
+): { percent: number; chance: number } | null {
+  const security = server.hackDifficulty ?? 100;
+  const minSecurity = server.minDifficulty ?? security;
+  if (security < 100) {
+    const scale = (100 - minSecurity) / (100 - security);
+    return {
+      percent: ns.hackAnalyze(host) * scale,
+      chance: ns.hackAnalyzeChance(host) * scale,
+    };
+  }
+  if (!ns.fileExists("Formulas.exe", "home")) return null;
+
+  const prepared = { ...server, hackDifficulty: minSecurity };
+  const player = ns.getPlayer();
+  return {
+    percent: ns.formulas.hacking.hackPercent(prepared, player),
+    chance: ns.formulas.hacking.hackChance(prepared, player),
   };
 }
 

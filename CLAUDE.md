@@ -81,6 +81,18 @@ design: treat it as history. Rules:
   operation and older timings land out of order.
 - Batches come before prep: prep only gets RAM no batch can use, and never delays a batch
   window that is known to be coming.
+- A running chain whose next wave isn't due yet holds the RAM that wave needs. It looks
+  like idle RAM, but without it worse targets take that RAM for a whole weaken time (the
+  BitNode 5 simulation lost a quarter of its income).
+- Quick earners (short-weaken targets that make money while the main targets fill up)
+  are only picked while over half the RAM is free, and a target the picker drops takes
+  nothing new. Kept on, they took RAM from the main targets for good (17% less early).
+  Backups (kept to be prepped) batch only while a main target is prepping; otherwise
+  their long weakens hold RAM the main targets need after a restart.
+- Launched batches size grow for the hacking level each hack lands with (the measured
+  leveling rate): at 75–90% hack fractions, grow only covers a hack stealing ~1% more
+  than planned, and a few levels per weaken time otherwise drain targets toward 0%. The
+  picker leaves leveling out, or targets swap places on it.
 - `--reserve` comes off home's RAM everywhere RAM is measured or used.
 - A second running copy prints an error and launches nothing; it never kills the other.
 - Planning and scheduling logic needs Node tests in `tests/multi-manager.test.mjs`.
