@@ -613,31 +613,28 @@ function renderStatus(
     ),
   );
 
-  ns.print(
+  const lines = [
     `=== MULTI-TARGET SCHEDULER ${config.dryRun ? "(DRY RUN)" : ""} ===`,
-  );
-  ns.print(
     `Loop ${state.loops} | up ${formatDuration(Date.now() - state.startedAt)} | ` +
       `launched ${state.launched} | failed ${state.launchFailures}` +
       (config.dryRun ? ` | would launch ${state.wouldLaunch}` : ""),
-  );
-  ns.print(
     `Network: ${state.hosts.length} known | ${snapshots.length} runners | ` +
       `rooted +${state.rooted} | deployed +${state.deployed}`,
-  );
-  ns.print(
     `RAM: ${formatRam(usable)} usable | ${formatRam(free)} schedulable | ` +
       `${formatRam(inFlightRam)} in flight | ${formatRam(config.homeReserve)} home reserve`,
-  );
-  ns.print(`Last commit: ${state.lastCommit}`);
-
-  renderTargets(ns, state);
-  renderInFlight(ns, state);
-  renderDecision(ns, decision, free);
+    `Last commit: ${state.lastCommit}`,
+    ...targetLines(ns, state),
+    ...inFlightLines(state),
+    ...decisionLines(decision, free),
+  ];
+  // One entry, not one per line: the game keeps only the newest 50 log
+  // entries by default, which cut the top off the status once there were
+  // many targets.
+  ns.print(lines.join("\n"));
 }
 
-function renderTargets(ns: NS, state: ManagerState): void {
-  ns.print(`--- targets (${state.targets.size}) ---`);
+function targetLines(ns: NS, state: ManagerState): string[] {
+  const lines = [`--- targets (${state.targets.size}) ---`];
 
   for (const record of rankedRecords(state)) {
     const observation = record.observation;
@@ -650,23 +647,23 @@ function renderTargets(ns: NS, state: ManagerState): void {
       : "-";
     const rate = record.economics?.expectedMoneyPerSecond ?? 0;
 
-    ns.print(
+    lines.push(
       `  ${record.host.padEnd(18)} ${record.phase.padEnd(19)} ` +
         `gen ${String(record.generation).padStart(3)} | ` +
         `money ${money.padStart(4)} | sec ${security.padStart(11)} | ` +
         `$${ns.format.number(rate)}/s`,
     );
   }
+  return lines;
 }
 
-function renderInFlight(ns: NS, state: ManagerState): void {
+function inFlightLines(state: ManagerState): string[] {
   const live = state.inFlight.receipts.filter((receipt) =>
     isLiveStatus(receipt.status),
   );
 
   if (live.length === 0 && state.recovered.length === 0) {
-    ns.print("--- in flight: none ---");
-    return;
+    return ["--- in flight: none ---"];
   }
 
   const groups = new Map<
@@ -703,13 +700,13 @@ function renderInFlight(ns: NS, state: ManagerState): void {
     groups.set(receipt.groupId, entry);
   }
 
-  ns.print(
+  const lines = [
     `--- in flight: ${groups.size} group(s), ${live.length} fragment(s) ---`,
-  );
+  ];
 
   const now = Date.now();
   for (const [id, entry] of groups) {
-    ns.print(
+    lines.push(
       `  ${id.padEnd(26)} ${entry.target.padEnd(16)} ` +
         `${String(entry.fragments).padStart(3)} frag | ` +
         `${formatRam(fromUnits(entry.units)).padStart(10)} | ` +
@@ -721,23 +718,24 @@ function renderInFlight(ns: NS, state: ManagerState): void {
   }
 
   if (state.recovered.length > 0) {
-    ns.print(
+    lines.push(
       `  recovered from a previous run: ${state.recovered.length} worker(s)`,
     );
   }
+  return lines;
 }
 
-function renderDecision(ns: NS, decision: Decision, freeRam: number): void {
+function decisionLines(decision: Decision, freeRam: number): string[] {
   if (decision.kind !== "idle") {
-    ns.print(`--- decision: ${describeDecision(decision)} ---`);
-    for (const line of groupFragments(decision.allocations))
-      ns.print(`  ${line}`);
-    return;
+    return [
+      `--- decision: ${describeDecision(decision)} ---`,
+      ...groupFragments(decision.allocations).map((line) => `  ${line}`),
+    ];
   }
 
-  ns.print(
+  const lines = [
     `--- idle: ${formatRam(freeRam)} unallocated (${decision.dominantReason}) ---`,
-  );
+  ];
 
   const byCode = new Map<string, string[]>();
   for (const reason of decision.reasons) {
@@ -747,8 +745,9 @@ function renderDecision(ns: NS, decision: Decision, freeRam: number): void {
   for (const [code, hosts] of byCode) {
     const shown = hosts.slice(0, 4).join(", ");
     const extra = hosts.length > 4 ? ` +${hosts.length - 4} more` : "";
-    ns.print(`  ${code.padEnd(26)} ${shown}${extra}`);
+    lines.push(`  ${code.padEnd(26)} ${shown}${extra}`);
   }
+  return lines;
 }
 
 /** One line per runner used by a committed allocation. */

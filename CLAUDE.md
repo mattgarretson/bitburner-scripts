@@ -91,9 +91,21 @@ reference example of a small script written this way.
 
 ## Architecture
 
+### batcher.ts (on trial as the replacement)
+
+`batcher.ts` is a deliberately simple, single-file batcher written because the user finds
+the multi-manager suite below far too large to read. It preps each target, then keeps a
+continuous stream of HWGW batches landing on it, launching only while the target reads
+prepped (so each batch's durations are read at minimum security). A target that drifts gets
+no new batches until its last one lands, then is prepped again. Per-target state is just
+the last landing time. Tunables are constants at the top; there are no flags and no tests.
+Keep it that way: none of the scheduler rules below apply to it, and changes should stay
+small. If the user's income comparison (`hack-income.ts`) favours it, the plan is to delete
+the three `multi-*` modules, their tests and both design docs, and trim this file to match.
+
 ### Module split
 
-`multi-manager.ts` is the multi-target HGW scheduler and the only hacking manager. It is
+`multi-manager.ts` is the multi-target HGW scheduler. It is
 kept as a readable event loop: refresh infrastructure → reconcile receipts → observe
 quiescent targets → snapshot runners → ask for one decision → commit it → render → sleep.
 It contains no allocation math. The work is split across:
@@ -151,6 +163,8 @@ planning, so it must not be circumvented anywhere.
 
 ## Scheduler rules
 
+These apply to `multi-manager.ts` and its modules only, not to `batcher.ts`.
+
 `docs/multi-target-design.md` is the accepted design for the scheduler.
 `docs/scheduler-improvement-plan.md` is the ordered work list against it —
 dependency-ordered, so do its items in order. Both predate the removal of the old
@@ -173,12 +187,18 @@ single-target `manager.ts`; ignore their references to it.
 `cloud-manager.ts` (buys/upgrades `ns.cloud` servers by lowest
 $/GB until all are at the ceiling, then exits),
 `xp-farm.ts` / `xp-grow.ts` (grow loop for hacking XP), `path.ts`
-(connect path to a host), `stop-hacking.ts` (kills the manager and all
-workers network-wide — run before replacing the suite).
+(connect path to a host), `stop-hacking.ts` (kills either manager and all
+workers network-wide — run before replacing the suite), `hack-income.ts` (measures
+hacking $/s over 10 minutes, to compare the two managers).
 
 `src/singularity/` holds Singularity-API scripts (`buy-programs.ts`, `backdoor.ts`);
 they import shared code as `../hacking-lib.ts`, so any script name they pass to
 Netscript must include the folder.
+
+`src/gang/` holds gang scripts: `manager.ts` runs a combat gang end to end (recruit,
+train until a task actually pays, ascend, buy equipment, work, and switch members to
+Territory Warfare only for the update that holds the 20 s power tick, which it detects
+from other gangs' power changing); `set-activity.ts` sets every member's task by hand.
 
 `src/README.txt` is the in-game user-facing quick reference and ships to `home` with the
 scripts; keep it in sync when flags or usage change.
