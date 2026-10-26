@@ -2,9 +2,8 @@
  * hack-income.ts — measures your hacking income for a few minutes, prints it
  * in dollars per second, then exits
  *
- * Counts money from every hack, whichever script ran it, so it works the same
- * for multi-manager.ts and batcher.ts. Start the manager, give it about five
- * minutes to prep and fill up, then run this.
+ * Counts money from every hack, whichever script ran it. Start the manager,
+ * give it about five minutes to prep and fill up, then run this.
  *
  * Usage: run hack-income.ts
  *
