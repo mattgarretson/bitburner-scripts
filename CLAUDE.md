@@ -61,16 +61,13 @@ Write for someone reading top to bottom; Prettier owns layout.
   `main`, a `fail(ns, message): never` helper), never `throw`. Pure functions return
   `ok: false` plus a reason instead.
 
-## Hacking managers
-
-`batcher.ts` is a deliberately simple single-file batcher, on trial against
-`multi-manager.ts`. Keep it small: constants only, no flags, no tests. The rules below
-don't apply to it.
+## Hacking manager
 
 `multi-manager.ts` is the multi-target scheduler. Its only flag is `--reserve`: it picks
 its own hack fraction and targets from a model of its batches at every network refresh.
-`hacking-lib.ts` holds what other scripts share with it. `docs/` describes an older
-design: treat it as history. Rules:
+`hacking-lib.ts` holds that batch model, plus the scan/root/deploy helpers other scripts
+share. The model prices everything with Formulas.exe, which the user always has; the
+manager exits without it. Rules:
 
 - Plan, then launch: a group is placed on a copy of the runners' free RAM and launched
   all or nothing; if any `ns.exec` fails, the PIDs already started are killed.

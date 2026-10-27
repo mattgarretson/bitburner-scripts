@@ -27,9 +27,9 @@
  */
 import {
   WORKER_FILES,
-  applyGrowSafetyMargin,
   buildPreparedBatch,
   deployWorkers,
+  growThreadsFor,
   loadWorkers,
   rootAvailableServers,
   scanNetwork,
@@ -69,10 +69,6 @@ const GROW_SAFETY_MARGIN = 0.02;
  */
 const SECURITY_TOLERANCE = 1e-6;
 const MONEY_READY_RATIO = 0.999;
-/** A server at this security can't be priced until it has been weakened once. */
-const MAX_SECURITY = 100;
-/** Wait after a group's workers end before reading the target again. */
-const SETTLE_MS = 250;
 /** How long a target sits out after a failed launch. */
 const BACKOFF_MS = 5_000;
 /** Most groups launched per loop, and the time allowed for launching them. */
@@ -89,23 +85,21 @@ const WORKER_FILE_LIST: readonly string[] = Object.values(WORKER_FILES);
 
 /**
  * Where a target is, and what the status window calls it: waiting for a
- * reading, ready for prep or batches, with a group in flight, settling after
- * one, or sitting out after a failed launch.
+ * reading, ready for prep or batches, with a group in flight, or sitting out
+ * after a failed launch.
  */
 const PHASES = {
   NEEDS_OBSERVATION: "reading",
   UNAVAILABLE: "can't hack",
-  SECURITY_PREP_READY: "needs weaken",
-  MONEY_PREP_READY: "needs grow",
+  PREP_READY: "needs prep",
   BATCH_READY: "ready",
   PREP_IN_FLIGHT: "prepping",
   BATCH_IN_FLIGHT: "batching",
-  SETTLING: "settling",
   BACKOFF: "backing off",
 } as const;
 
 type Phase = keyof typeof PHASES;
-type Purpose = "batch" | "money-prep" | "security-prep";
+type Purpose = "batch" | "prep";
 type Settings = { homeReserve: number };
 
 type Observation = {
@@ -124,14 +118,17 @@ type Economics = {
   batch: Batch | null;
   /** Expected $ per GB-second of RAM its batch holds; 0 without a batch. */
   score: number;
-  moneyPrep: {
-    growThreadsNeeded: number;
+  /** What prepping it takes from where it is now. */
+  prep: {
+    /** Grow threads to refill its money; 0 when it is full. */
+    growThreads: number;
+    /** Weaken threads for the security it is already over its minimum. */
+    excessWeakenThreads: number;
     growSecurityPerThread: number;
     weakenPerThread: number;
     growTime: number;
     weakenTime: number;
   };
-  securityPrep: { threadsNeeded: number; weakenTime: number };
 };
 
 type Target = {
@@ -141,7 +138,6 @@ type Target = {
   economics: Economics | null;
   /** The group it is waiting on; "recovered" for a previous copy's workers. */
   activeGroupId: string | null;
-  settleAfter: number;
   backoffUntil: number;
   waitingSince: number;
   /** Batches in its current chain; appended batches are numbered on from here. */
@@ -270,6 +266,13 @@ export async function main(ns: NS): Promise<void> {
 
   const workers = loadWorkers(ns);
   if (!workers) return;
+  if (!ns.fileExists("Formulas.exe", "home")) {
+    ns.tprint(
+      `ERROR: ${ns.getScriptName()} prices its batches with Formulas.exe, ` +
+        "which isn't on home.",
+    );
+    return;
+  }
 
   const otherPid = otherCopyPid(ns);
   if (otherPid !== null) {
@@ -407,7 +410,7 @@ function pickTargets(ns: NS, state: State): void {
   const plan = choosePlan(plans, state.hackFraction);
   state.hackFraction = plan.fraction;
   state.plan = { fed: plan.fed, income: plan.income };
-  const main = targetsToKeep(plan, unpricedHosts(ns, hosts, plan));
+  const main = targetsToKeep(plan);
   // Quick earners only use RAM that sits idle, as it does after a start. Kept
   // on once RAM is busy, they would take it from the main targets for good.
   const free = fromUnits(state.runners.reduce((sum, r) => sum + r.units, 0));
@@ -437,7 +440,7 @@ function pickTargets(ns: NS, state: State): void {
 /** Whether a target needs or is getting prep before it can batch. */
 function isPrepping(target: Target | undefined): boolean {
   if (!target) return false;
-  return isPrepPhase(target.phase) || target.phase === "PREP_IN_FLIGHT";
+  return target.phase === "PREP_READY" || target.phase === "PREP_IN_FLIGHT";
 }
 
 /**
@@ -486,19 +489,10 @@ export function choosePlan(
   return best;
 }
 
-/**
- * The targets a plan keeps batching, then PREP_TARGETS more to prep. Servers
- * that can't be priced yet get those prep slots first: one weaken lets them
- * be priced, and they are often the richest.
- */
-export function targetsToKeep(
-  plan: FractionPlan,
-  unpriced: string[],
-): string[] {
+/** The targets a plan keeps batching, then the next PREP_TARGETS to prep. */
+export function targetsToKeep(plan: FractionPlan): string[] {
   const ranked = plan.ranked.map(({ host }) => host);
-  const batching = ranked.slice(0, plan.fed);
-  const toPrep = [...unpriced, ...ranked.slice(plan.fed)];
-  return [...batching, ...toPrep.slice(0, PREP_TARGETS)];
+  return ranked.slice(0, plan.fed + PREP_TARGETS);
 }
 
 /**
@@ -517,22 +511,6 @@ export function quickEarners(plan: FractionPlan, keep: string[]): string[] {
     )
     .slice(0, QUICK_TARGETS)
     .map(({ host }) => host);
-}
-
-/**
- * Servers the plan couldn't price because they sit at maximum security (only
- * without Formulas.exe), most max money per weaken-second first.
- */
-function unpricedHosts(ns: NS, hosts: string[], plan: FractionPlan): string[] {
-  return hosts
-    .filter((host) => !plan.ranked.some((priced) => priced.host === host))
-    .filter((host) => ns.getServerSecurityLevel(host) >= MAX_SECURITY)
-    .map((host) => ({
-      host,
-      value: ns.getServerMaxMoney(host) / ns.getWeakenTime(host),
-    }))
-    .sort((a, b) => b.value - a.value)
-    .map((row) => row.host);
 }
 
 /**
@@ -593,8 +571,9 @@ function releaseAdoptedTargets(ns: NS, state: State): void {
 }
 
 /**
- * Moves targets on once their wait is over. SETTLING and BACKOFF end in a
- * fresh reading, and a group whose workers have all ended goes to SETTLING.
+ * Sends a target back for a fresh reading once its backoff is over, or once
+ * every worker of its group has ended: a worker's effect has landed by the
+ * time its process ends, so the reading can be taken straight away.
  */
 export function closeFinishedGroups(
   targets: Map<string, Target>,
@@ -602,13 +581,6 @@ export function closeFinishedGroups(
   now: number,
 ): void {
   for (const target of targets.values()) {
-    if (target.phase === "SETTLING") {
-      if (now >= target.settleAfter) {
-        target.phase = "NEEDS_OBSERVATION";
-        target.activeGroupId = null;
-      }
-      continue;
-    }
     if (target.phase === "BACKOFF") {
       if (now >= target.backoffUntil) target.phase = "NEEDS_OBSERVATION";
       continue;
@@ -618,8 +590,8 @@ export function closeFinishedGroups(
     if (groupId === null || groupId === "recovered") continue;
     if (inFlight.some((receipt) => receipt.groupId === groupId)) continue;
 
-    target.phase = "SETTLING";
-    target.settleAfter = now + SETTLE_MS;
+    target.phase = "NEEDS_OBSERVATION";
+    target.activeGroupId = null;
   }
 }
 
@@ -645,7 +617,7 @@ export function readTargets(ns: NS, state: State, now: number): void {
     }
     if (target.activeGroupId !== null) continue;
     if (hasWorkersInFlight(state.inFlight, target.host)) continue;
-    if (target.phase === "SETTLING" || target.phase === "BACKOFF") continue;
+    if (target.phase === "BACKOFF") continue;
 
     const observation = observe(ns, target.host);
     const economics = observation.valid
@@ -715,34 +687,39 @@ export function computeEconomics(
   // the target's current money, which is wrong for growth planned after a hack.
   const growSecurityPerThread = ns.growthAnalyzeSecurity(1, undefined, 1);
 
-  const multiplier = observation.maxMoney / Math.max(1, observation.money);
-  let growThreadsNeeded = applyGrowSafetyMargin(
-    ns.growthAnalyze(host, multiplier, 1),
-    GROW_SAFETY_MARGIN,
-  );
-  if (!Number.isFinite(growThreadsNeeded) || growThreadsNeeded < 1) {
-    growThreadsNeeded = 1;
-  }
-  const { security, minSecurity, growTime, weakenTime } = observation;
+  const { money, maxMoney, security, minSecurity } = observation;
+  const moneyShort = money < maxMoney * MONEY_READY_RATIO;
+  const excess = security - minSecurity;
 
   return {
     batch,
     score: batch ? moneyPerGbSecond(batch) : 0,
-    moneyPrep: {
-      growThreadsNeeded,
+    prep: {
+      growThreads: moneyShort ? growThreadsToRefill(ns, host) : 0,
+      excessWeakenThreads:
+        excess > SECURITY_TOLERANCE ? Math.ceil(excess / weakenPerThread) : 0,
       growSecurityPerThread,
       weakenPerThread,
-      growTime,
-      weakenTime,
-    },
-    securityPrep: {
-      threadsNeeded: Math.max(
-        1,
-        Math.ceil((security - minSecurity) / weakenPerThread),
-      ),
-      weakenTime,
+      growTime: observation.growTime,
+      weakenTime: observation.weakenTime,
     },
   };
+}
+
+/** Grow threads to refill a target from its money and security now: at least one. */
+function growThreadsToRefill(ns: NS, host: string): number {
+  const server = ns.getServer(host);
+  const multiplier =
+    (server.moneyMax ?? 0) / Math.max(1, server.moneyAvailable ?? 0);
+  const player = ns.getPlayer();
+  const threads = growThreadsFor(
+    ns,
+    server,
+    player,
+    multiplier,
+    GROW_SAFETY_MARGIN,
+  );
+  return Number.isFinite(threads) && threads >= 1 ? threads : 1;
 }
 
 /**
@@ -856,8 +833,8 @@ async function sleepUntilDue(ns: NS, state: State): Promise<void> {
 }
 
 /**
- * How long to sleep: until a worker's expected end, a settle or backoff
- * ending, an append window opening, or the network refresh. Never less than
+ * How long to sleep: until a worker's expected end, a backoff ending, an
+ * append window opening, or the network refresh. Never less than
  * MIN_SLEEP_MS or more than MAX_SLEEP_MS.
  */
 function nextWakeDelay(state: State, now: number): number {
@@ -867,9 +844,6 @@ function nextWakeDelay(state: State, now: number): number {
     wakeAt = Math.min(wakeAt, receipt.endsAt);
   }
   for (const target of state.targets.values()) {
-    if (target.phase === "SETTLING") {
-      wakeAt = Math.min(wakeAt, target.settleAfter);
-    }
     if (target.phase === "BACKOFF") {
       wakeAt = Math.min(wakeAt, target.backoffUntil);
     }
@@ -937,7 +911,7 @@ export function decide(
   const prepCtx = { ...ctx, runners };
   const freeUnits = runners.reduce((sum, runner) => sum + runner.units, 0);
   const prepTargets = targets
-    .filter((target) => isPrepPhase(target.phase) && !target.retiring)
+    .filter((target) => target.phase === "PREP_READY" && !target.retiring)
     .filter((target) => isIdle(target, inFlight))
     .sort(byPrepOrder);
   for (const target of prepTargets) {
@@ -1091,41 +1065,23 @@ export function planWave(
 }
 
 /**
- * The largest prep that fits. Over minimum security that is weaken, or grow
- * with enough weaken for both when money is short too; otherwise grow plus
- * its weaken. Unlike a wave, prep may shrink to partial progress.
+ * The largest prep that fits: grow, if money is short, with weaken for its
+ * security and for any already over minimum. If no grow fits beside all that
+ * weaken, just the weaken. Unlike a wave, prep may shrink to partial progress.
  */
 export function planPrep(target: Target, ctx: PlanContext): Placement {
-  const { observation, economics } = target;
   const groupId = `${TAG}-p${ctx.serial}-${target.host}`;
   const noPlan: Placement = { ok: false, requiredUnits: 0 };
-  if (!observation || !economics) return noPlan;
-  const { moneyPrep, securityPrep } = economics;
+  if (!target.economics) return noPlan;
+  const { prep } = target.economics;
 
-  if (target.phase !== "SECURITY_PREP_READY") {
-    if (moneyPrep.growThreadsNeeded < 1) return noPlan;
-    return planGrowPrep(target.host, moneyPrep, 0, "money-prep", groupId, ctx);
+  if (prep.growThreads >= 1) {
+    const withGrow = planGrowPrep(target.host, prep, groupId, ctx);
+    if (withGrow.ok || prep.excessWeakenThreads < 1) return withGrow;
   }
-  if (securityPrep.threadsNeeded < 1) return noPlan;
+  if (prep.excessWeakenThreads < 1) return noPlan;
 
-  const moneyShort =
-    observation.money < observation.maxMoney * MONEY_READY_RATIO;
-  if (moneyShort && moneyPrep.growThreadsNeeded > 0) {
-    const extraWeaken = securityPrep.threadsNeeded;
-    const combined = planGrowPrep(
-      target.host,
-      moneyPrep,
-      extraWeaken,
-      "security-prep",
-      groupId,
-      ctx,
-    );
-    if (combined.ok) return combined;
-  }
-
-  const { weakenTime } = securityPrep;
-  const max = Math.max(1, Math.floor(securityPrep.threadsNeeded));
-  return largestThatFits(ctx.runners, max, (threads) => {
+  return largestThatFits(ctx.runners, prep.excessWeakenThreads, (threads) => {
     const weaken = ctx.workers.weaken;
     const job = makeJob(
       `${groupId}-0`,
@@ -1133,39 +1089,37 @@ export function planPrep(target: Target, ctx: PlanContext): Placement {
       weaken,
       threads,
       LAUNCH_LEAD_MS,
-      weakenTime,
+      prep.weakenTime,
     );
-    return newGroup(groupId, "security-prep", target.host, ctx.now, [job]);
+    return newGroup(groupId, "prep", target.host, ctx.now, [job]);
   });
 }
 
 /**
  * The largest grow that fits together with the weaken that cancels its
- * security, plus `extraWeaken` threads for security already over minimum.
+ * security, plus the weaken for security already over minimum.
  */
 function planGrowPrep(
   host: string,
-  prep: Economics["moneyPrep"],
-  extraWeaken: number,
-  purpose: Purpose,
+  prep: Economics["prep"],
   groupId: string,
   ctx: PlanContext,
 ): Placement {
   const batchId = `${groupId}-0`;
   const { grow, weaken } = ctx.workers;
   const { growTime: g, weakenTime: w } = prep;
-  const max = Math.max(1, Math.floor(prep.growThreadsNeeded));
+  const max = Math.max(1, Math.floor(prep.growThreads));
 
   return largestThatFits(ctx.runners, max, (growThreads) => {
     const growSecurity = growThreads * prep.growSecurityPerThread;
     const weakenThreads =
-      Math.max(0, Math.floor(extraWeaken)) +
+      prep.excessWeakenThreads +
       Math.max(
         1,
         Math.ceil(growSecurity / Math.max(1e-9, prep.weakenPerThread)),
       );
     const lead = LAUNCH_LEAD_MS;
-    return newGroup(groupId, purpose, host, ctx.now, [
+    return newGroup(groupId, "prep", host, ctx.now, [
       makeJob(
         batchId,
         "PREP-G",
@@ -1369,7 +1323,6 @@ export function newTarget(host: string): Target {
     observation: null,
     economics: null,
     activeGroupId: null,
-    settleAfter: 0,
     backoffUntil: 0,
     waitingSince: 0,
     scheduledBatchCount: 0,
@@ -1388,11 +1341,10 @@ export function classify(
   >,
 ): Phase {
   if (!reading.valid) return "UNAVAILABLE";
-  if (reading.security > reading.minSecurity + SECURITY_TOLERANCE)
-    return "SECURITY_PREP_READY";
-  if (reading.money < reading.maxMoney * MONEY_READY_RATIO)
-    return "MONEY_PREP_READY";
-  return "BATCH_READY";
+  const securityHigh =
+    reading.security > reading.minSecurity + SECURITY_TOLERANCE;
+  const moneyShort = reading.money < reading.maxMoney * MONEY_READY_RATIO;
+  return securityHigh || moneyShort ? "PREP_READY" : "BATCH_READY";
 }
 
 /** Whether its latest reading is at minimum security and maximum money. */
@@ -1401,10 +1353,6 @@ function readsPrepped(target: Target): boolean {
     target.observation !== null &&
     classify(target.observation) === "BATCH_READY"
   );
-}
-
-function isPrepPhase(phase: Phase): boolean {
-  return phase === "SECURITY_PREP_READY" || phase === "MONEY_PREP_READY";
 }
 
 /** Stores a fresh reading and moves the target to the phase it calls for. */
@@ -1416,7 +1364,7 @@ export function recordObservation(
 ): void {
   const phase = classify(observation);
   // A target still waiting for prep keeps its place in the prep queue.
-  if (!(isPrepPhase(phase) && isPrepPhase(target.phase))) {
+  if (!(phase === "PREP_READY" && target.phase === "PREP_READY")) {
     target.waitingSince = now;
   }
   target.phase = phase;

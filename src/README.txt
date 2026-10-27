@@ -3,7 +3,7 @@ BITBURNER 3.0.2 SCRIPT SUITE
 REPLACE A RUNNING SUITE
   run stop-hacking.ts
 
-START HACKING
+START HACKING (multi-manager.ts needs Formulas.exe on home)
   run multi-manager.ts                same as --reserve 8
   run multi-manager.ts --reserve 64
 
@@ -20,13 +20,8 @@ MULTI-MANAGER OPTIONS
   Everything else (landing gap, batches per wave, launch lead, ...) is a constant at the top of multi-manager.ts.
   Any other option, including the old --hack and --targets, stops it with an "unknown option" error.
 
-BATCHER (simpler replacement for multi-manager, on trial; run stop-hacking.ts before switching either way)
-  run batcher.ts                     preps every target, then keeps H/W/G/W batches landing on each, best $ per GB of RAM first
-  tail batcher.ts                    status: free RAM, hacking $/s since start, one line per target
-  Settings are constants at the top of batcher.ts: HACK_FRACTION (0.5), GAP_MS (200), HOME_RESERVE_GB (8)
-  run hack-income.ts                 measures hacking $/s over 5 minutes, for comparing the two; start it ~5 min after the manager
-
 OTHER UTILITIES
+  run hack-income.ts                 measures hacking $/s over 5 minutes; start it ~5 min after the manager
   run cloud-manager.ts [--yolo]      buy/upgrade cloud servers evenly until maxed (--yolo: spend every dollar, no cap or reserve)
   run cloud-step.ts                  make just the one purchase cloud-manager would make next, print it, exit
   run cloud-sizes.ts                 list every cloud server's RAM, plus the total

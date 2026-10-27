@@ -1,6 +1,7 @@
 /**
  * Shared Netscript helpers: network scan/root/deploy, worker costs, and the
- * prepared-batch model used to size batches and rank targets.
+ * prepared-batch model used to size batches and rank targets. The batch model
+ * prices everything with Formulas.exe, so it needs Formulas.exe on home.
  */
 
 export const WORKER_FILES = {
@@ -8,13 +9,6 @@ export const WORKER_FILES = {
   grow: "worker-grow.ts",
   weaken: "worker-weaken.ts",
 } as const;
-
-// Bitburner's server-growth constants. These are used only to translate the
-// live growthAnalyze() result to the same server at minimum security.
-const SERVER_BASE_GROWTH_INCR = 0.03;
-const SERVER_MAX_GROWTH_LOG = 0.00349388925425578;
-const HACK_TIME_DIFF_FACTOR = 2.5;
-const HACK_TIME_BASE_DIFF = 500;
 
 export type WorkerFile = { file: string; ram: number };
 export type Workers = {
@@ -35,16 +29,8 @@ export type Config = {
   levelsPerMs?: number;
 };
 
-type PreparedMetrics = {
-  maxMoney: number;
-  minSecurity: number;
-  requiredLevel: number;
-  hackPercent: number;
-  hackChance: number;
-  hackTime: number;
-  growTime: number;
-  weakenTime: number;
-};
+type Player = ReturnType<NS["getPlayer"]>;
+type Server = ReturnType<NS["getServer"]>;
 
 export type Batch = {
   expectedMoney: number;
@@ -163,7 +149,8 @@ export function deployWorkers(
 }
 
 /**
- * Build a complete batch for a hypothetical prepared target. The requested
+ * Build a complete batch for the target as it will be once prepped, at
+ * minimum security and maximum money, priced by Formulas.exe. The requested
  * hack fraction is reduced only when the current network cannot fit one batch.
  */
 export function buildPreparedBatch(
@@ -173,10 +160,24 @@ export function buildPreparedBatch(
   config: Config,
   availableRam: number,
 ): Batch | null {
-  const metrics = getPreparedMetrics(ns, host);
-  if (!metrics || metrics.hackPercent <= 0 || metrics.hackChance <= 0)
-    return null;
-  const drift = hackDrift(ns, metrics, config.levelsPerMs ?? 0);
+  const server = ns.getServer(host);
+  const maxMoney = server.moneyMax ?? 0;
+  if (maxMoney <= 0) return null;
+  const prepped = {
+    ...server,
+    hackDifficulty: server.minDifficulty,
+    moneyAvailable: maxMoney,
+  };
+  const player = ns.getPlayer();
+  const formulas = ns.formulas.hacking;
+  const hackPercent = formulas.hackPercent(prepped, player);
+  const hackChance = formulas.hackChance(prepped, player);
+  if (!(hackPercent > 0 && hackChance > 0)) return null;
+  const weakenTime = formulas.weakenTime(prepped, player);
+  // A thread steals more at each level, so grow is sized for the level the
+  // hack lands with, a weaken time from now.
+  const landing = atLevel(player, landingLevel(player, config, weakenTime));
+  const landingPercent = formulas.hackPercent(prepped, landing);
 
   for (
     let requestedFraction = config.hackFraction;
@@ -185,19 +186,20 @@ export function buildPreparedBatch(
   ) {
     const hackThreads = Math.max(
       1,
-      Math.floor(requestedFraction / metrics.hackPercent),
+      Math.floor(requestedFraction / hackPercent),
     );
-    const actualFraction = hackThreads * metrics.hackPercent;
+    const actualFraction = hackThreads * hackPercent;
 
     // A one-thread hack can exceed the requested fraction. That is fine, but
     // draining nearly the entire server makes batching unstable and expensive.
-    if (actualFraction <= 0 || actualFraction >= 0.9) continue;
+    if (actualFraction >= 0.9) continue;
 
-    // Grow must refill what the hack takes at the level it lands with.
-    const landingFraction = Math.min(0.95, actualFraction * drift);
-    const growMultiplier = 1 / (1 - landingFraction);
-    const growThreads = applyGrowSafetyMargin(
-      growthThreadsAtSecurity(ns, host, growMultiplier, metrics.minSecurity),
+    const landingFraction = Math.min(0.95, hackThreads * landingPercent);
+    const growThreads = growThreadsFor(
+      ns,
+      prepped,
+      player,
+      1 / (1 - landingFraction),
       config.growSafetyMargin ?? 0,
     );
     const weakenHackThreads = weakenThreadsForHack(ns, hackThreads);
@@ -211,141 +213,64 @@ export function buildPreparedBatch(
     if (ramNeeded > availableRam + 1e-9) continue;
 
     return {
-      expectedMoney: metrics.maxMoney * actualFraction * metrics.hackChance,
+      expectedMoney: maxMoney * actualFraction * hackChance,
       hackThreads,
       growThreads,
       weakenHackThreads,
       weakenGrowThreads,
       ramNeeded,
-      hackTime: metrics.hackTime,
-      growTime: metrics.growTime,
-      weakenTime: metrics.weakenTime,
+      hackTime: formulas.hackTime(prepped, player),
+      growTime: formulas.growTime(prepped, player),
+      weakenTime,
     };
   }
 
   return null;
 }
 
-/**
- * How much more a hack steals by the time it lands, a weaken time from now,
- * at `levelsPerMs`: what a thread steals scales with (level - required + 1) /
- * level.
- */
-function hackDrift(
-  ns: NS,
-  metrics: PreparedMetrics,
-  levelsPerMs: number,
+/** The hacking level a hack launched now lands with, at `levelsPerMs`. */
+function landingLevel(
+  player: Player,
+  config: Config,
+  weakenTime: number,
 ): number {
-  // Types are erased at runtime, so anything but a real rate means no drift.
-  if (!(Number.isFinite(levelsPerMs) && levelsPerMs > 0)) return 1;
-  const level = ns.getHackingLevel();
-  const landingLevel = level + levelsPerMs * metrics.weakenTime;
-  const factor = (at: number): number => (at - metrics.requiredLevel + 1) / at;
-  const drift = factor(landingLevel) / factor(level);
-  return Number.isFinite(drift) && drift > 1 ? drift : 1;
+  const level = player.skills.hacking;
+  const levelsPerMs = config.levelsPerMs ?? 0;
+  // Types are erased at runtime, so anything but a real rate means no leveling.
+  if (!(Number.isFinite(levelsPerMs) && levelsPerMs > 0)) return level;
+  return level + levelsPerMs * weakenTime;
+}
+
+/** The player as they will be at another hacking level. */
+function atLevel(player: Player, level: number): Player {
+  return { ...player, skills: { ...player.skills, hacking: level } };
+}
+
+/**
+ * Grow threads that multiply the money on `server`, at its security as given,
+ * by `multiplier`, plus `margin` more; Infinity if it can't grow. Sized from
+ * the growth per thread, not Formulas.exe's growThreads: that one is exact
+ * for a single grow and rounds up before the margin is added. In simulation
+ * it cost extra prep cycles, likely because a grow split across servers lands
+ * piece by piece, each piece raising security for the next.
+ */
+export function growThreadsFor(
+  ns: NS,
+  server: Server,
+  player: Player,
+  multiplier: number,
+  margin: number,
+): number {
+  const perThread = Math.log(
+    ns.formulas.hacking.growPercent(server, 1, player),
+  );
+  if (!(perThread > 0)) return Infinity;
+  return applyGrowSafetyMargin(Math.log(multiplier) / perThread, margin);
 }
 
 export function applyGrowSafetyMargin(threads: number, margin: number): number {
   if (!Number.isFinite(threads)) return threads;
   return Math.max(1, Math.ceil(threads * (1 + Math.max(0, margin))));
-}
-
-export function hackTimeScale(
-  requiredSkill: number | null | undefined,
-  fromSecurity: number,
-  toSecurity: number,
-): number {
-  const skill =
-    typeof requiredSkill === "number" && Number.isFinite(requiredSkill)
-      ? Math.max(0, requiredSkill)
-      : 0;
-  const from = Math.max(0, fromSecurity);
-  const to = Math.max(0, toSecurity);
-  const at = (security: number): number =>
-    HACK_TIME_DIFF_FACTOR * skill * security + HACK_TIME_BASE_DIFF;
-  return at(to) / at(from);
-}
-
-function getPreparedMetrics(ns: NS, host: string): PreparedMetrics | null {
-  const server = ns.getServer(host);
-  const maxMoney = server.moneyMax ?? 0;
-  const currentSecurity = server.hackDifficulty ?? 100;
-  const minSecurity = server.minDifficulty ?? currentSecurity;
-  const requiredLevel = server.requiredHackingSkill;
-
-  if (maxMoney <= 0 || minSecurity <= 0) return null;
-  const odds = oddsAtMinimumSecurity(ns, host, server);
-  if (!odds) return null;
-
-  // H/G/W time shares the same affine difficulty factor.
-  const timeScale = hackTimeScale(requiredLevel, currentSecurity, minSecurity);
-
-  return {
-    maxMoney,
-    minSecurity,
-    requiredLevel: requiredLevel ?? 1,
-    hackPercent: clamp(odds.percent, 0, 1),
-    hackChance: clamp(odds.chance, 0, 1),
-    hackTime: ns.getHackTime(host) * timeScale,
-    growTime: ns.getGrowTime(host) * timeScale,
-    weakenTime: ns.getWeakenTime(host) * timeScale,
-  };
-}
-
-/**
- * Hack percent and chance once the server is at minimum security. Both are
- * linear in (100 - security), so the live answers scale down to the minimum.
- * At 100 security they read 0, and only Formulas.exe can answer, if you have it.
- */
-function oddsAtMinimumSecurity(
-  ns: NS,
-  host: string,
-  server: ReturnType<NS["getServer"]>,
-): { percent: number; chance: number } | null {
-  const security = server.hackDifficulty ?? 100;
-  const minSecurity = server.minDifficulty ?? security;
-  if (security < 100) {
-    const scale = (100 - minSecurity) / (100 - security);
-    return {
-      percent: ns.hackAnalyze(host) * scale,
-      chance: ns.hackAnalyzeChance(host) * scale,
-    };
-  }
-  if (!ns.fileExists("Formulas.exe", "home")) return null;
-
-  const prepared = { ...server, hackDifficulty: minSecurity };
-  const player = ns.getPlayer();
-  return {
-    percent: ns.formulas.hacking.hackPercent(prepared, player),
-    chance: ns.formulas.hacking.hackChance(prepared, player),
-  };
-}
-
-/**
- * growthAnalyze() uses current security. This translates that result to a
- * hypothetical security level by scaling the game's adjusted growth log.
- */
-function growthThreadsAtSecurity(
-  ns: NS,
-  host: string,
-  multiplier: number,
-  targetSecurity: number,
-): number {
-  const currentSecurity = ns.getServerSecurityLevel(host);
-  const liveThreads = ns.growthAnalyze(host, multiplier, 1);
-
-  if (!Number.isFinite(liveThreads) || liveThreads <= 0) return liveThreads;
-
-  const currentGrowthLog = adjustedGrowthLog(currentSecurity);
-  const targetGrowthLog = adjustedGrowthLog(targetSecurity);
-  return liveThreads * (currentGrowthLog / targetGrowthLog);
-}
-
-function adjustedGrowthLog(security: number): number {
-  return Math.min(
-    Math.log1p(SERVER_BASE_GROWTH_INCR / Math.max(1, security)),
-    SERVER_MAX_GROWTH_LOG,
-  );
 }
 
 function weakenThreadsForHack(ns: NS, hackThreads: number): number {
@@ -365,10 +290,4 @@ function weakenThreadsForGrow(ns: NS, growThreads: number): number {
         ns.weakenAnalyze(1, 1),
     ),
   );
-}
-
-/** Non-finite input gives the minimum. */
-function clamp(value: number, minimum: number, maximum: number): number {
-  if (!Number.isFinite(value)) return minimum;
-  return Math.min(maximum, Math.max(minimum, value));
 }
