@@ -12,6 +12,7 @@ WATCH IT
   ps                               lists PIDs; "tail <PID>" works without the options
   run multi-manager.ts --tail      opens the log window as it starts
   The window shows hacking $/s, game lag, the plan, and per target what it's doing, its RAM, and when it starts paying.
+  Targets are listed most $/s first; a target's $/s is what its hacks in the last minute were planned to steal.
   Game lag near 200 ms (the gap between landings) can make batches land out of order.
 
 MULTI-MANAGER OPTIONS

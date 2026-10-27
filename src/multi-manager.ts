@@ -150,6 +150,8 @@ type Target = {
   backup: boolean;
   /** When the first hack of its current chain lands. */
   paysAt: number;
+  /** Its launched hacks: when each lands, and the money it is planned to steal. */
+  hacks: Array<{ landsAt: number; money: number }>;
 };
 
 /** One worker script run: its threads, delay and expected run time. */
@@ -1338,6 +1340,7 @@ export function newTarget(host: string): Target {
     quick: false,
     backup: false,
     paysAt: 0,
+    hacks: [],
   };
 }
 
@@ -1390,14 +1393,17 @@ export function markLaunched(target: Target, group: Group): void {
   }
   target.phase = "BATCH_IN_FLIGHT";
   target.scheduledBatchCount += group.batchCount;
-  if (!group.continuation) target.paysAt = firstHackLanding(group);
+  const landings = hackLandings(group);
+  if (!group.continuation) target.paysAt = Math.min(...landings);
+  const money = target.economics?.batch?.expectedMoney ?? 0;
+  for (const landsAt of landings) target.hacks.push({ landsAt, money });
 }
 
-/** When a wave's first hack lands. */
-function firstHackLanding(group: Group): number {
-  const hacks = group.jobs.filter((job) => job.label === "H");
-  const first = Math.min(...hacks.map((job) => job.delay + job.duration));
-  return group.plannedAt + first;
+/** When each of a wave's hacks lands. */
+function hackLandings(group: Group): number[] {
+  return group.jobs
+    .filter((job) => job.label === "H")
+    .map((job) => group.plannedAt + job.delay + job.duration);
 }
 
 /** Takes a target out for BACKOFF_MS, after which it is read again. */
@@ -1505,9 +1511,9 @@ function hackingMoney(ns: NS): number {
 }
 
 /**
- * Reads hacking money and level, keeping LEVELING_WINDOW_MS of readings: the
- * status window shows income and lag from them, and batches are sized for
- * leveling.
+ * Reads hacking money and level, keeping LEVELING_WINDOW_MS of readings, and
+ * forgets hacks that landed over INCOME_WINDOW_MS ago: the status window
+ * shows income and lag from these, and batches are sized for leveling.
  */
 function trackProgress(ns: NS, state: State): void {
   const now = Date.now();
@@ -1517,6 +1523,11 @@ function trackProgress(ns: NS, state: State): void {
   readings.push({ at: now, money: hackingMoney(ns), level, late });
   while (readings.length > 1 && now - readings[0].at > LEVELING_WINDOW_MS) {
     readings.shift();
+  }
+  for (const target of state.targets.values()) {
+    target.hacks = target.hacks.filter(
+      (hack) => now - hack.landsAt <= INCOME_WINDOW_MS,
+    );
   }
 }
 
@@ -1557,7 +1568,7 @@ function renderStatus(ns: NS, state: State): void {
       `${state.plan.fed} main target(s) | full speed ` +
       formatIncome(ns, state.plan.income),
     `Last launch: ${state.lastLaunch}`,
-    ...targetLines(state, now),
+    ...targetLines(ns, state, now),
   ];
   const previous = state.previousWorkers.length;
   if (previous > 0) {
@@ -1569,19 +1580,44 @@ function renderStatus(ns: NS, state: State): void {
   ns.print(lines.join("\n"));
 }
 
-/** A header, then one line per target, best first. */
-function targetLines(state: State, now: number): string[] {
-  const targets = [...state.targets.values()].sort(
-    (a, b) => scoreOf(b) - scoreOf(a) || compareText(a.host, b.host),
-  );
+/** A header, then one line per target, most $/s first. */
+function targetLines(ns: NS, state: State, now: number): string[] {
+  const span = Math.min(INCOME_WINDOW_MS, now - state.startedAt);
+  const rows = [...state.targets.values()]
+    .map((target) => ({ target, income: recentIncome(target, now, span) }))
+    .sort(
+      (a, b) =>
+        b.income - a.income ||
+        scoreOf(b.target) - scoreOf(a.target) ||
+        compareText(a.target.host, b.target.host),
+    );
   return [
-    `--- targets (${targets.length}), best first ---`,
-    targetRow("target", "doing", "money", "security", "RAM", "when"),
-    ...targets.map((target) => targetLine(state, target, now)),
+    `--- targets (${rows.length}), most $/s first ---`,
+    targetRow("target", "$/s", "doing", "money", "security", "RAM", "when"),
+    ...rows.map(({ target, income }) =>
+      targetLine(ns, state, target, income, now),
+    ),
   ];
 }
 
-function targetLine(state: State, target: Target, now: number): string {
+/**
+ * What a target's hacks that landed in the last `span` ms were planned to
+ * steal, per second.
+ */
+function recentIncome(target: Target, now: number, span: number): number {
+  const money = target.hacks
+    .filter((hack) => hack.landsAt <= now && now - hack.landsAt <= span)
+    .reduce((sum, hack) => sum + hack.money, 0);
+  return perSecond(money, span);
+}
+
+function targetLine(
+  ns: NS,
+  state: State,
+  target: Target,
+  income: number,
+  now: number,
+): string {
   const { host, observation } = target;
   const workers = state.inFlight.filter((receipt) => receipt.target === host);
   const units = workers.reduce((sum, receipt) => sum + receipt.units, 0);
@@ -1594,12 +1630,15 @@ function targetLine(state: State, target: Target, now: number): string {
     : "-";
   const ram = units > 0 ? formatRam(fromUnits(units)) : "-";
   const timing = timingOf(target, workers, now);
-  return targetRow(host, activityOf(target), money, security, ram, timing);
+  const earning = income > 0 ? `$${ns.format.number(income)}` : "-";
+  const activity = activityOf(target);
+  return targetRow(host, earning, activity, money, security, ram, timing);
 }
 
 /** Lines a target's columns up under the header. */
 function targetRow(
   host: string,
+  earning: string,
   activity: string,
   money: string,
   security: string,
@@ -1607,8 +1646,9 @@ function targetRow(
   timing: string,
 ): string {
   return (
-    `  ${host.padEnd(18)} ${activity.padEnd(12)} ${money.padStart(5)} ` +
-    `${security.padStart(11)} ${ram.padStart(10)}  ${timing}`
+    `  ${host.padEnd(18)} ${earning.padStart(9)}  ${activity.padEnd(12)} ` +
+    `${money.padStart(5)} ${security.padStart(11)} ${ram.padStart(10)}  ` +
+    timing
   );
 }
 
