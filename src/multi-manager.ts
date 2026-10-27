@@ -1143,17 +1143,23 @@ function planGrowPrep(
 }
 
 /**
- * Binary-searches the largest size, from 1 to `max`, whose group fits. Waves
- * shrink by whole batches and prep by whole grow/weaken pairs, so whatever
- * fits is complete. When nothing fits, says how much a size-1 group needs.
+ * The largest size, from 1 to `max`, whose group fits: `max` if it does,
+ * else a binary search below it. Waves shrink by whole batches and prep by
+ * whole grow/weaken pairs, so whatever fits is complete. When nothing fits,
+ * says how much a size-1 group needs.
  */
 function largestThatFits(
   runners: Runner[],
   max: number,
   groupOfSize: (size: number) => Group,
 ): Placement {
+  // Every waiting chain's next wave is placed each loop to hold its RAM, and
+  // with RAM to spare a whole wave fits: one placement instead of five.
+  const whole = place(runners, groupOfSize(max));
+  if (whole.ok) return whole;
+
   let low = 1;
-  let high = max;
+  let high = max - 1;
   let best: Placement | null = null;
 
   while (low <= high) {
