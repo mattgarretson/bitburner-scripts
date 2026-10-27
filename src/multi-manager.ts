@@ -14,10 +14,10 @@
  * target's workers have ended, it is read again before anything new is
  * planned for it.
  *
- * Uses the RAM of every server you have root on, home last and less
- * --reserve GB. Won't start while another copy is running, and won't kill
- * it either. Targets with workers left over from a previous copy are left
- * alone until those workers end.
+ * Needs Formulas.exe on home. Uses the RAM of every server you have root on,
+ * home last and less --reserve GB. Won't start while another copy is
+ * running, and won't kill it either. Targets with workers left over from a
+ * previous copy are left alone until those workers end.
  *
  * Usage: run multi-manager.ts [--reserve 8]
  *   --reserve  GB kept free on home
@@ -289,10 +289,12 @@ export async function main(ns: NS): Promise<void> {
 
   while (true) {
     const now = Date.now();
-    if (now >= state.nextNetworkRefresh) refreshNetwork(ns, state);
+    if (now >= state.nextNetworkRefresh) {
+      refreshNetwork(ns, state);
+      releaseAdoptedTargets(ns, state);
+    }
 
     state.inFlight = dropEndedWorkers(ns, state.inFlight, now);
-    releaseAdoptedTargets(ns, state);
     closeFinishedGroups(state.targets, state.inFlight, now);
     state.runners = readRunners(ns, state);
     readTargets(ns, state, now);
@@ -358,6 +360,8 @@ function refreshNetwork(ns: NS, state: State): void {
   state.workerHosts = capacity.workerHosts;
   state.capacityRam = capacity.ram;
   state.nextNetworkRefresh = Date.now() + NETWORK_REFRESH_MS;
+  // The picker checks free RAM, which nothing has read yet at startup.
+  state.runners = readRunners(ns, state);
   pickTargets(ns, state);
 }
 
@@ -550,21 +554,19 @@ export function dropEndedWorkers(
   );
 }
 
-/** Once all of a target's previous-copy workers have ended, it is read fresh. */
-function releaseAdoptedTargets(ns: NS, state: State): void {
-  const ended = state.previousWorkers.filter(
-    (worker) => !ns.isRunning(worker.pid, worker.host),
+/**
+ * Forgets a previous copy's workers once they have ended, and sends each
+ * target with none left for a fresh reading. Done on each network refresh,
+ * not every loop: after a restart there can be thousands of them, and their
+ * targets have been waiting a weaken time already.
+ */
+export function releaseAdoptedTargets(ns: NS, state: State): void {
+  state.previousWorkers = state.previousWorkers.filter((worker) =>
+    ns.isRunning(worker.pid, worker.host),
   );
-  state.previousWorkers = state.previousWorkers.filter(
-    (worker) => !ended.includes(worker),
-  );
-
-  for (const worker of ended) {
-    const target = state.targets.get(worker.target);
-    if (!target || target.activeGroupId !== "recovered") continue;
-    if (state.previousWorkers.some((other) => other.target === worker.target))
-      continue;
-
+  const held = new Set(state.previousWorkers.map((worker) => worker.target));
+  for (const target of state.targets.values()) {
+    if (target.activeGroupId !== "recovered" || held.has(target.host)) continue;
     target.activeGroupId = null;
     target.phase = "NEEDS_OBSERVATION";
   }
