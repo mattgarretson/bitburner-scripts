@@ -10,15 +10,40 @@ export const WORKER_FILES = {
   weaken: "worker-weaken.ts",
 } as const;
 
+/** A batch too big for the network is tried again, stealing this much less. */
+const FRACTION_STEP = 0.8;
+/**
+ * A batch never steals this much or more. A one-thread hack can steal more
+ * than was asked for, and draining nearly a whole server makes batching
+ * unstable and expensive.
+ */
+const MAX_STEAL_FRACTION = 0.9;
+/** Grow is sized for at most this much stolen, however far the level climbs first. */
+const MAX_LANDING_FRACTION = 0.95;
+/** Lets float rounding still reach the smallest hack fraction. */
+const FRACTION_TOLERANCE = 1e-12;
+/** Lets float rounding still fit a batch that needs exactly the RAM there is. */
+const RAM_TOLERANCE = 1e-9;
+
+/** A worker script and its RAM per thread. */
 export type WorkerFile = { file: string; ram: number };
-export type Workers = {
-  hack: WorkerFile;
-  grow: WorkerFile;
-  weaken: WorkerFile;
+export type Workers = Record<keyof typeof WORKER_FILES, WorkerFile>;
+
+/**
+ * The arguments every worker is started with. The workers read the first
+ * three: they wait `delay` less the time since `plannedAt`. The manager finds
+ * its own workers again by `batchId`.
+ */
+export type WorkerArgs = {
+  target: string;
+  delay: number;
+  plannedAt: number;
+  batchId: string;
+  label: string;
 };
 
 /** How buildPreparedBatch sizes a batch. */
-export type Config = {
+export type BatchSizing = {
   hackFraction: number;
   minimumHackFraction: number;
   growSafetyMargin?: number;
@@ -32,18 +57,22 @@ export type Config = {
 type Player = ReturnType<NS["getPlayer"]>;
 type Server = ReturnType<NS["getServer"]>;
 
+/** A prepared batch: its threads, its RAM and money, and its run times in ms. */
 export type Batch = {
+  /** $ it steals, weighted by its hack chance. */
   expectedMoney: number;
   hackThreads: number;
   growThreads: number;
   weakenHackThreads: number;
   weakenGrowThreads: number;
+  /** GB all its threads take together. */
   ramNeeded: number;
   hackTime: number;
   growTime: number;
   weakenTime: number;
 };
 
+/** Each worker's file and RAM, or null after saying in the terminal what is wrong. */
 export function loadWorkers(ns: NS): Workers | null {
   for (const file of Object.values(WORKER_FILES)) {
     if (!ns.fileExists(file, "home")) {
@@ -52,19 +81,10 @@ export function loadWorkers(ns: NS): Workers | null {
     }
   }
 
-  const workers = {
-    hack: {
-      file: WORKER_FILES.hack,
-      ram: ns.getScriptRam(WORKER_FILES.hack, "home"),
-    },
-    grow: {
-      file: WORKER_FILES.grow,
-      ram: ns.getScriptRam(WORKER_FILES.grow, "home"),
-    },
-    weaken: {
-      file: WORKER_FILES.weaken,
-      ram: ns.getScriptRam(WORKER_FILES.weaken, "home"),
-    },
+  const workers: Workers = {
+    hack: workerFile(ns, WORKER_FILES.hack),
+    grow: workerFile(ns, WORKER_FILES.grow),
+    weaken: workerFile(ns, WORKER_FILES.weaken),
   };
 
   if (Object.values(workers).some((worker) => worker.ram <= 0)) {
@@ -75,6 +95,26 @@ export function loadWorkers(ns: NS): Workers | null {
   return workers;
 }
 
+/** A worker file and its RAM per thread, as home reports it. */
+function workerFile(ns: NS, file: string): WorkerFile {
+  return { file, ram: ns.getScriptRam(file, "home") };
+}
+
+/** A worker's arguments, in the order ns.exec passes them. */
+export function toWorkerArgs(
+  args: WorkerArgs,
+): [string, number, number, string, string] {
+  return [args.target, args.delay, args.plannedAt, args.batchId, args.label];
+}
+
+/** The target and batch id of a running worker, from its arguments. */
+export function fromWorkerArgs(
+  args: ReadonlyArray<string | number | boolean>,
+): Pick<WorkerArgs, "target" | "batchId"> {
+  return { target: String(args[0] ?? ""), batchId: String(args[3] ?? "") };
+}
+
+/** Every server on the network, home included. */
 export function scanNetwork(ns: NS): string[] {
   const seen = new Set<string>(["home"]);
   const stack: string[] = ["home"];
@@ -97,7 +137,7 @@ export function scanNetwork(ns: NS): string[] {
  * Hacking level is deliberately irrelevant here: rooted high-level servers
  * are still useful as RAM hosts.
  */
-export function rootAvailableServers(ns: NS, hosts: string[]): number {
+export function rootAvailableServers(ns: NS, hosts: string[]): void {
   const crackers: Array<[string, (host: string) => void]> = [
     ["BruteSSH.exe", (host) => ns.brutessh(host)],
     ["FTPCrack.exe", (host) => ns.ftpcrack(host)],
@@ -106,8 +146,6 @@ export function rootAvailableServers(ns: NS, hosts: string[]): number {
     ["SQLInject.exe", (host) => ns.sqlinject(host)],
   ];
 
-  let rooted = 0;
-
   for (const host of hosts) {
     if (host === "home" || ns.hasRootAccess(host)) continue;
 
@@ -115,23 +153,20 @@ export function rootAvailableServers(ns: NS, hosts: string[]): number {
       if (ns.fileExists(program, "home")) crack(host);
     }
 
-    if (ns.nuke(host)) rooted++;
+    ns.nuke(host);
   }
-
-  return rooted;
 }
 
 /**
- * Copies workers only to newly seen/missing hosts instead of SCPing the entire
- * network every loop.
+ * Copies the workers only to hosts that are new or missing them, instead of
+ * to the whole network every time.
  */
 export function deployWorkers(
   ns: NS,
   hosts: string[],
   deployedHosts: Set<string>,
-): number {
+): void {
   const files = Object.values(WORKER_FILES);
-  let copied = 0;
 
   for (const host of hosts) {
     if (host === "home" || !ns.hasRootAccess(host)) continue;
@@ -139,13 +174,8 @@ export function deployWorkers(
     const missing = files.some((file) => !ns.fileExists(file, host));
     if (!missing && deployedHosts.has(host)) continue;
 
-    if (ns.scp(files, host, "home")) {
-      deployedHosts.add(host);
-      copied++;
-    }
+    if (ns.scp(files, host, "home")) deployedHosts.add(host);
   }
-
-  return copied;
 }
 
 /**
@@ -157,7 +187,7 @@ export function buildPreparedBatch(
   ns: NS,
   host: string,
   workers: Workers,
-  config: Config,
+  sizing: BatchSizing,
   availableRam: number,
 ): Batch | null {
   const server = ns.getServer(host);
@@ -176,31 +206,31 @@ export function buildPreparedBatch(
   const weakenTime = formulas.weakenTime(prepped, player);
   // A thread steals more at each level, so grow is sized for the level the
   // hack lands with, a weaken time from now.
-  const landing = atLevel(player, landingLevel(player, config, weakenTime));
+  const landing = atLevel(player, landingLevel(player, sizing, weakenTime));
   const landingPercent = formulas.hackPercent(prepped, landing);
 
   for (
-    let requestedFraction = config.hackFraction;
-    requestedFraction >= config.minimumHackFraction - 1e-12;
-    requestedFraction *= 0.8
+    let requestedFraction = sizing.hackFraction;
+    requestedFraction >= sizing.minimumHackFraction - FRACTION_TOLERANCE;
+    requestedFraction *= FRACTION_STEP
   ) {
     const hackThreads = Math.max(
       1,
       Math.floor(requestedFraction / hackPercent),
     );
     const actualFraction = hackThreads * hackPercent;
+    if (actualFraction >= MAX_STEAL_FRACTION) continue;
 
-    // A one-thread hack can exceed the requested fraction. That is fine, but
-    // draining nearly the entire server makes batching unstable and expensive.
-    if (actualFraction >= 0.9) continue;
-
-    const landingFraction = Math.min(0.95, hackThreads * landingPercent);
+    const landingFraction = Math.min(
+      MAX_LANDING_FRACTION,
+      hackThreads * landingPercent,
+    );
     const growThreads = growThreadsFor(
       ns,
       prepped,
       player,
       1 / (1 - landingFraction),
-      config.growSafetyMargin ?? 0,
+      sizing.growSafetyMargin ?? 0,
     );
     const weakenHackThreads = weakenThreadsForHack(ns, hackThreads);
     const weakenGrowThreads = weakenThreadsForGrow(ns, growThreads);
@@ -210,7 +240,7 @@ export function buildPreparedBatch(
       growThreads * workers.grow.ram +
       (weakenHackThreads + weakenGrowThreads) * workers.weaken.ram;
 
-    if (ramNeeded > availableRam + 1e-9) continue;
+    if (ramNeeded > availableRam + RAM_TOLERANCE) continue;
 
     return {
       expectedMoney: maxMoney * actualFraction * hackChance,
@@ -231,11 +261,11 @@ export function buildPreparedBatch(
 /** The hacking level a hack launched now lands with, at `levelsPerMs`. */
 function landingLevel(
   player: Player,
-  config: Config,
+  sizing: BatchSizing,
   weakenTime: number,
 ): number {
   const level = player.skills.hacking;
-  const levelsPerMs = config.levelsPerMs ?? 0;
+  const levelsPerMs = sizing.levelsPerMs ?? 0;
   // Types are erased at runtime, so anything but a real rate means no leveling.
   if (!(Number.isFinite(levelsPerMs) && levelsPerMs > 0)) return level;
   return level + levelsPerMs * weakenTime;
@@ -268,11 +298,13 @@ export function growThreadsFor(
   return applyGrowSafetyMargin(Math.log(multiplier) / perThread, margin);
 }
 
+/** `threads` raised by `margin`, rounded up, and at least one. */
 export function applyGrowSafetyMargin(threads: number, margin: number): number {
   if (!Number.isFinite(threads)) return threads;
   return Math.max(1, Math.ceil(threads * (1 + Math.max(0, margin))));
 }
 
+/** Weaken threads that cancel what `hackThreads` hack threads add to security. */
 function weakenThreadsForHack(ns: NS, hackThreads: number): number {
   return Math.max(
     1,
@@ -280,6 +312,7 @@ function weakenThreadsForHack(ns: NS, hackThreads: number): number {
   );
 }
 
+/** Weaken threads that cancel what `growThreads` grow threads add to security. */
 function weakenThreadsForGrow(ns: NS, growThreads: number): number {
   // No hostname: a hostname can cap this against the target's current money,
   // which is wrong when planning growth that occurs after a future hack.
